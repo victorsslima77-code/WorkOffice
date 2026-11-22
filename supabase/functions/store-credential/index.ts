@@ -79,12 +79,20 @@ async function verifyKeyWithProvider(
     }
 
     if (provider === 'google') {
-      if (!key.startsWith('AIza')) {
-        return { valid: false, reason: 'Chaves Google Gemini devem iniciar com AIza.' };
+      if (!key.startsWith('AIza') && !key.startsWith('AQ.')) {
+        return {
+          valid: false,
+          reason: 'Chaves Google Gemini devem iniciar com AQ. ou AIza.',
+        };
       }
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`,
-        { method: 'GET' },
+        {
+          method: 'GET',
+          headers: {
+            'x-goog-api-key': key,
+          },
+        },
       );
       if (!res.ok) {
         return {

@@ -34,11 +34,22 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 400 });
   }
 
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  // Lê o client_id encapsulado no Vault do próprio usuário (sem variáveis globais de servidor)
+  let userClientId: string | null = null;
+  if (integration) {
+    const { data: vaultOauth } = await supabase.rpc('get_office_youtube_oauth_for_owner', {
+      p_office_id: officeId,
+    });
+    const rawCid = (vaultOauth as { client_id?: string } | null)?.client_id?.trim();
+    if (rawCid && !rawCid.startsWith('wo_test_')) {
+      userClientId = rawCid;
+    }
+  }
+
   const redirectUri = `${origin}/api/integrations/youtube/callback`;
-  const authorizeUrl = clientId
+  const authorizeUrl = userClientId
     ? `https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({
-        client_id: clientId,
+        client_id: userClientId,
         redirect_uri: redirectUri,
         response_type: 'code',
         access_type: 'offline',
@@ -68,11 +79,16 @@ export async function POST(request: NextRequest) {
   const officeId = String(body.officeId ?? '').trim();
   const channelId = String(body.channelId ?? '').trim();
   const channelTitle = String(body.channelTitle ?? channelId).trim();
+  const clientId = String(body.clientId ?? '').trim();
+  const clientSecret = String(body.clientSecret ?? '').trim();
   const refreshToken = String(body.refreshToken ?? '').trim();
 
-  if (!officeId || !channelId || refreshToken.length < 10) {
+  if (!officeId || !channelId || refreshToken.length < 8) {
     return NextResponse.json(
-      { error: 'Informe officeId, channelId e um refreshToken OAuth válido.' },
+      {
+        error:
+          'Informe officeId, channelId e as credenciais OAuth (clientId, clientSecret e refreshToken) para armazenar no seu Cofre (Vault).',
+      },
       { status: 400 },
     );
   }
@@ -83,6 +99,8 @@ export async function POST(request: NextRequest) {
     p_channel_id: channelId,
     p_channel_title: channelTitle,
     p_scopes: YOUTUBE_OAUTH_SCOPES,
+    p_client_id: clientId,
+    p_client_secret: clientSecret,
   });
 
   if (error) {

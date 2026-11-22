@@ -135,11 +135,11 @@ export function validateProviderKeyFormat(
     };
   }
 
-  if (provider === 'google' && !key.startsWith('AIza')) {
+  if (provider === 'google' && !key.startsWith('AIza') && !key.startsWith('AQ.')) {
     return {
       valid: false,
       reason:
-        'Chaves do Google Gemini AI Studio devem começar com "AIza" (ou use "wo_test_google_..." para modo sandbox).',
+        'Chaves do Google Gemini AI Studio devem começar com "AQ." ou "AIza" (ou use "wo_test_google_..." para modo sandbox).',
       isSandboxKey: false,
     };
   }

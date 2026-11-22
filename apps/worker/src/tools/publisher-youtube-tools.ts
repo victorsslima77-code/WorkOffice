@@ -7,6 +7,8 @@ import {
 export interface YoutubeOAuthCredentials {
   channelId: string;
   refreshToken: string;
+  clientId?: string;
+  clientSecret?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -47,19 +49,26 @@ export interface YoutubeVideoAnalyticsSnapshot {
 }
 
 /**
- * Troca o refresh_token OAuth salvo no Supabase Vault por um access_token valido do Google.
+ * Troca o refresh_token OAuth salvo no Supabase Vault do usuario por um access_token valido do Google,
+ * utilizando o client_id e client_secret encapsulados no proprio Vault do usuario (BYOK).
  */
 export async function exchangeYoutubeRefreshToken(
-  refreshToken: string,
+  oauthOrToken: YoutubeOAuthCredentials | string,
 ): Promise<{ accessToken: string; isSandbox: boolean }> {
-  const clean = refreshToken.trim();
-  if (!clean || clean.startsWith('wo_test_')) {
-    return { accessToken: 'sandbox_access_token', isSandbox: true };
-  }
+  const refreshToken =
+    typeof oauthOrToken === 'string' ? oauthOrToken.trim() : oauthOrToken.refreshToken.trim();
+  const clientId =
+    typeof oauthOrToken === 'string' ? '' : (oauthOrToken.clientId?.trim() ?? '');
+  const clientSecret =
+    typeof oauthOrToken === 'string' ? '' : (oauthOrToken.clientSecret?.trim() ?? '');
 
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
+  if (
+    !refreshToken ||
+    refreshToken.startsWith('wo_test_') ||
+    !clientId ||
+    !clientSecret ||
+    clientId.startsWith('wo_test_')
+  ) {
     return { accessToken: 'sandbox_access_token', isSandbox: true };
   }
 
@@ -69,7 +78,7 @@ export async function exchangeYoutubeRefreshToken(
     body: new URLSearchParams({
       client_id: clientId,
       client_secret: clientSecret,
-      refresh_token: clean,
+      refresh_token: refreshToken,
       grant_type: 'refresh_token',
     }),
   });
@@ -128,7 +137,7 @@ export async function uploadShortToYoutubeChannel(
   }
 
   if (params.oauth?.refreshToken) {
-    const tokenInfo = await exchangeYoutubeRefreshToken(params.oauth.refreshToken);
+    const tokenInfo = await exchangeYoutubeRefreshToken(params.oauth);
     if (!tokenInfo.isSandbox && params.mp4Buffer) {
       const metadataRes = await fetch(
         'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
@@ -214,7 +223,7 @@ export async function fetchShortAnalyticsSnapshot(params: {
 }): Promise<YoutubeVideoAnalyticsSnapshot> {
   if (params.oauth?.refreshToken) {
     try {
-      const tokenInfo = await exchangeYoutubeRefreshToken(params.oauth.refreshToken);
+      const tokenInfo = await exchangeYoutubeRefreshToken(params.oauth);
       if (!tokenInfo.isSandbox) {
         const statsRes = await fetch(
           `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${encodeURIComponent(params.youtubeVideoId)}`,

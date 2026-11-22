@@ -60,8 +60,18 @@ export default function OfficeManagePage() {
   const [credentials, setCredentials] = useState<MaskedCredential[]>([]);
   const [youtubeIntegration, setYoutubeIntegration] = useState<{
     channel_id: string;
-    metadata?: { channel_title?: string };
+    metadata?: {
+      channel_title?: string;
+      client_id_last4?: string;
+      refresh_token_last4?: string;
+    };
   } | null>(null);
+  const [ytChannelIdInput, setYtChannelIdInput] = useState('');
+  const [ytChannelTitleInput, setYtChannelTitleInput] = useState('');
+  const [ytClientIdInput, setYtClientIdInput] = useState('');
+  const [ytClientSecretInput, setYtClientSecretInput] = useState('');
+  const [ytRefreshTokenInput, setYtRefreshTokenInput] = useState('');
+  const [showYtVaultForm, setShowYtVaultForm] = useState(false);
   const [connectingYt, setConnectingYt] = useState(false);
   const [loading, setLoading] = useState(true);
   const [savingAgentId, setSavingAgentId] = useState<string | null>(null);
@@ -189,30 +199,44 @@ export default function OfficeManagePage() {
     }
   }
 
-  async function handleConnectSandboxYoutube() {
+  async function handleSaveYoutubeOAuthToUserVault() {
     setConnectingYt(true);
     setStatusMsg(null);
     setErrorMsg(null);
     try {
+      const channelId = ytChannelIdInput.trim() || `UC_${officeId.slice(0, 8)}`;
+      const channelTitle =
+        ytChannelTitleInput.trim() || `${office?.name ?? 'Canal'} Shorts (Vault do Usuário)`;
+      const clientId = ytClientIdInput.trim() || `wo_test_yt_client_${Date.now()}`;
+      const clientSecret = ytClientSecretInput.trim() || `wo_test_yt_secret_${Date.now()}`;
+      const refreshToken = ytRefreshTokenInput.trim() || `wo_test_youtube_refresh_${Date.now()}`;
+
       const res = await fetch('/api/integrations/youtube', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           officeId,
-          channelId: `UC_${officeId.slice(0, 8)}`,
-          channelTitle: `${office?.name ?? 'Canal'} Shorts (OAuth Vault)`,
-          refreshToken: `wo_test_youtube_refresh_${Date.now()}`,
+          channelId,
+          channelTitle,
+          clientId,
+          clientSecret,
+          refreshToken,
         }),
       });
       const data = await res.json();
       if (!res.ok) {
-        setErrorMsg(data.error ?? 'Erro ao conectar canal YouTube no Vault.');
+        setErrorMsg(data.error ?? 'Erro ao criptografar credenciais OAuth do YouTube no Vault.');
         return;
       }
       setYoutubeIntegration(data.integration);
-      setStatusMsg('Canal do YouTube conectado com refresh_token criptografado no Supabase Vault!');
+      setShowYtVaultForm(false);
+      setYtClientSecretInput('');
+      setYtRefreshTokenInput('');
+      setStatusMsg(
+        'Credenciais OAuth 2.0 do YouTube (Client ID, Client Secret e Refresh Token) encapsuladas e criptografadas no seu Cofre (Supabase Vault)!',
+      );
     } catch {
-      setErrorMsg('Falha ao conectar canal do YouTube.');
+      setErrorMsg('Falha ao salvar credenciais do YouTube no Vault.');
     } finally {
       setConnectingYt(false);
     }
@@ -305,46 +329,137 @@ export default function OfficeManagePage() {
           </div>
         )}
 
-        <section className="mb-6 flex flex-wrap items-center justify-between gap-4 border-2 border-slate-700 bg-slate-900 p-4 text-xs">
-          <div>
-            <span className="text-[10px] font-bold uppercase tracking-widest text-amber-400">
-              Integração do Escritório // OAuth 2.0 + Supabase Vault
-            </span>
-            <h2 className="text-sm font-bold text-white">
-              Canal do YouTube para o Publicador / Analista
-            </h2>
-            <p className="text-slate-400">
-              {youtubeIntegration
-                ? `Canal Conectado: ${youtubeIntegration.metadata?.channel_title ?? youtubeIntegration.channel_id} (${youtubeIntegration.channel_id})`
-                : 'Nenhum canal conectado. Conecte via OAuth para o Publicador enviar Shorts e coletar métricas no YouTube Analytics.'}
-            </p>
+        <section className="mb-6 border-2 border-slate-700 bg-slate-900 p-4 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <span className="text-[10px] font-bold uppercase tracking-widest text-amber-400">
+                Cofre do Usuário (BYOK Supabase Vault) // YouTube Data API v3 &amp; Analytics
+              </span>
+              <h2 className="text-sm font-bold text-white">
+                Credenciais OAuth 2.0 do Canal do YouTube (Encapsuladas por Usuário)
+              </h2>
+              <p className="text-slate-400">
+                {youtubeIntegration
+                  ? `Canal Conectado: ${youtubeIntegration.metadata?.channel_title ?? youtubeIntegration.channel_id} (${youtubeIntegration.channel_id}) • Client ID: ••••${youtubeIntegration.metadata?.client_id_last4 ?? 'vault'} • Refresh Token: ••••${youtubeIntegration.metadata?.refresh_token_last4 ?? 'vault'}`
+                  : 'Cada usuário mantém suas próprias credenciais OAuth (Client ID, Client Secret e Refresh Token) criptografadas no seu Cofre (Supabase Vault), garantindo cota isolada de 10.000 unidades/dia (6 Shorts/dia).'}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {youtubeIntegration ? (
+                <>
+                  <span className="border border-emerald-500/60 bg-emerald-950/60 px-2.5 py-1 text-[10px] font-bold uppercase text-emerald-300">
+                    🔒 Criptografado no Cofre do Usuário
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowYtVaultForm((prev) => !prev)}
+                    className="border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-bold uppercase text-slate-200 hover:border-amber-400"
+                  >
+                    Rotacionar Credencial
+                  </button>
+                  <button
+                    type="button"
+                    disabled={connectingYt}
+                    onClick={handleDisconnectYoutube}
+                    className="border border-red-500/70 bg-red-950/40 px-3 py-1.5 text-xs font-bold uppercase text-red-200 hover:border-red-400"
+                  >
+                    Revogar do Vault
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowYtVaultForm((prev) => !prev)}
+                  className="border-2 border-emerald-400 bg-emerald-500 px-4 py-1.5 text-xs font-bold uppercase text-slate-950 hover:bg-emerald-400"
+                >
+                  {showYtVaultForm
+                    ? 'Fechar Cofre YouTube'
+                    : '+ Configurar OAuth YouTube no Cofre do Usuário'}
+                </button>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            {youtubeIntegration ? (
-              <>
-                <span className="border border-emerald-500/60 bg-emerald-950/60 px-2.5 py-1 text-[10px] font-bold uppercase text-emerald-300">
-                  OAuth Ativo no Vault
+
+          {showYtVaultForm && (
+            <div className="mt-4 grid gap-3 border-t border-slate-800 pt-4 sm:grid-cols-2 lg:grid-cols-5">
+              <div>
+                <label className="mb-1 block text-[10px] uppercase text-slate-400">
+                  Channel ID do YouTube
+                </label>
+                <input
+                  type="text"
+                  value={ytChannelIdInput}
+                  onChange={(e) => setYtChannelIdInput(e.target.value)}
+                  placeholder="Ex: UC_xYz123..."
+                  className="w-full border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-white"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] uppercase text-slate-400">
+                  Nome do Canal
+                </label>
+                <input
+                  type="text"
+                  value={ytChannelTitleInput}
+                  onChange={(e) => setYtChannelTitleInput(e.target.value)}
+                  placeholder="Ex: Meu Canal de Cortes"
+                  className="w-full border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-white"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] uppercase text-slate-400">
+                  Google OAuth Client ID
+                </label>
+                <input
+                  type="text"
+                  value={ytClientIdInput}
+                  onChange={(e) => setYtClientIdInput(e.target.value)}
+                  placeholder="...apps.googleusercontent.com"
+                  className="w-full border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-white"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] uppercase text-slate-400">
+                  Google OAuth Client Secret
+                </label>
+                <input
+                  type="password"
+                  value={ytClientSecretInput}
+                  onChange={(e) => setYtClientSecretInput(e.target.value)}
+                  placeholder="GOCSPX-..."
+                  className="w-full border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-white"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] uppercase text-slate-400">
+                  OAuth Refresh Token
+                </label>
+                <input
+                  type="password"
+                  value={ytRefreshTokenInput}
+                  onChange={(e) => setYtRefreshTokenInput(e.target.value)}
+                  placeholder="1//0g... (ou vazio p/ Sandbox)"
+                  className="w-full border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-white"
+                />
+              </div>
+              <div className="flex items-center justify-end gap-2 sm:col-span-2 lg:col-span-5">
+                <span className="mr-auto text-[11px] text-slate-400">
+                  Dica: deixe os campos em branco e clique em salvar para gerar uma credencial
+                  Sandbox de teste no seu Vault.
                 </span>
                 <button
                   type="button"
                   disabled={connectingYt}
-                  onClick={handleDisconnectYoutube}
-                  className="border border-red-500/70 bg-red-950/40 px-3 py-1.5 text-xs font-bold uppercase text-red-200 hover:border-red-400"
+                  onClick={handleSaveYoutubeOAuthToUserVault}
+                  className="border-2 border-amber-400 bg-amber-500 px-4 py-1.5 text-xs font-bold uppercase text-slate-950 hover:bg-amber-400 disabled:opacity-50"
                 >
-                  Desconectar Canal
+                  {connectingYt
+                    ? 'Criptografando no Vault...'
+                    : '🔒 Criptografar e Salvar no Cofre do Usuário'}
                 </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                disabled={connectingYt}
-                onClick={handleConnectSandboxYoutube}
-                className="border-2 border-emerald-400 bg-emerald-500 px-4 py-1.5 text-xs font-bold uppercase text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
-              >
-                {connectingYt ? 'Conectando no Vault...' : '+ Conectar Canal YouTube (OAuth Vault)'}
-              </button>
-            )}
-          </div>
+              </div>
+            </div>
+          )}
         </section>
 
         <section className="mb-6 border-2 border-slate-700 bg-slate-900 p-5">

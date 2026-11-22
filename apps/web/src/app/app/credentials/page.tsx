@@ -226,7 +226,7 @@ export default function CredentialsVaultPage() {
                     provider === 'anthropic'
                       ? 'sk-ant-...'
                       : provider === 'google'
-                        ? 'AIza...'
+                        ? 'AQ.Ab... ou AIza...'
                         : 'sk-...'
                   }
                   className="w-full border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:border-amber-400 focus:outline-none"

@@ -10,13 +10,25 @@ export async function GET(request: NextRequest) {
     return NextResponse.redirect(`${origin}/app?error=youtube_oauth_missing_params`);
   }
 
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const supabase = await createSupabaseServerClient();
+  const { data: vaultOauth, error: vaultErr } = await supabase.rpc(
+    'get_office_youtube_oauth_for_owner',
+    { p_office_id: officeId },
+  );
+
+  const parsedOauth = vaultOauth as {
+    channel_id?: string;
+    client_id?: string;
+    client_secret?: string;
+  } | null;
+
+  const clientId = parsedOauth?.client_id?.trim() ?? '';
+  const clientSecret = parsedOauth?.client_secret?.trim() ?? '';
   const redirectUri = `${origin}/api/integrations/youtube/callback`;
 
-  if (!clientId || !clientSecret) {
+  if (vaultErr || !clientId || !clientSecret) {
     return NextResponse.redirect(
-      `${origin}/app/offices/${officeId}?error=youtube_oauth_not_configured`,
+      `${origin}/app/offices/${officeId}?error=youtube_oauth_not_in_user_vault`,
     );
   }
 
@@ -52,7 +64,7 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    let channelId = 'UC_workoffice_channel';
+    let channelId = parsedOauth?.channel_id || 'UC_workoffice_channel';
     let channelTitle = 'Canal Conectado YouTube';
 
     const chanRes = await fetch(
@@ -71,7 +83,6 @@ export async function GET(request: NextRequest) {
       if (first?.snippet?.title) channelTitle = first.snippet.title;
     }
 
-    const supabase = await createSupabaseServerClient();
     await supabase.rpc('store_office_youtube_integration', {
       p_office_id: officeId,
       p_refresh_token: refreshToken,
@@ -81,6 +92,8 @@ export async function GET(request: NextRequest) {
         'https://www.googleapis.com/auth/youtube.upload',
         'https://www.googleapis.com/auth/yt-analytics.readonly',
       ],
+      p_client_id: clientId,
+      p_client_secret: clientSecret,
     });
 
     return NextResponse.redirect(`${origin}/app/offices/${officeId}?youtube=connected`);

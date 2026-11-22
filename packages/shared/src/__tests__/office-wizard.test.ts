@@ -16,6 +16,9 @@ describe('@workoffice/shared — Etapa 3 (Wizard de Escritorio, Contratacao e Va
       true,
     );
     expect(validateProviderKeyFormat('google', 'AIzaSyValidGoogleKeyFormat12345').valid).toBe(true);
+    expect(validateProviderKeyFormat('google', 'AQ.Ab8RN6ValidGoogleAiStudioAuthKey1234').valid).toBe(
+      true,
+    );
     expect(validateProviderKeyFormat('openai', 'sk-proj-validOpenAiKey12345678').valid).toBe(true);
 
     // Chave de sandbox para testes locais sem expor chave real
