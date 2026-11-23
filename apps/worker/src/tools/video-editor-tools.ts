@@ -25,10 +25,33 @@ export interface SpokenSubtitleCue {
   text: string;
 }
 
+export type SubtitleTransitionStyle = 'pop' | 'fade_slide' | 'blur_in';
+export type CutTransitionStyle = 'fade' | 'smoothleft' | 'smoothright' | 'dissolve';
+
 export interface EditorSubtitleStyle {
-  accentColor?: 'yellow' | 'red' | 'white' | 'green';
+  accentColor?: 'yellow' | 'red' | 'white' | 'green' | 'cyan';
   highlightWords?: string[];
   applyDynamicZoom?: boolean;
+  /** Variacoes sutis de entrada/saida das legendas ASS alternadas ao longo do Short */
+  subtitleTransitions?: SubtitleTransitionStyle[];
+  /** Transicao sutil aplicada entre jump-cuts de silencio / mudancas de plano */
+  cutTransition?: CutTransitionStyle;
+  /** Instantes especificos (em segundos no clipe original) para aplicar punch-in zoom sutil (1.07x) */
+  zoomMomentsSec?: number[];
+  /** Remove pausas silenciosas >= 0.45s automaticamente */
+  removeSilences?: boolean;
+}
+
+export interface SilenceInterval {
+  startSec: number;
+  endSec: number;
+}
+
+export interface ActiveEditSegment {
+  startSec: number;
+  endSec: number;
+  /** Fator de enquadramento (1.00 = normal, 1.07 = punch-in sutil em momento de destaque) */
+  zoomFactor: number;
 }
 
 export interface ExtractedSpokenTranscript {
@@ -233,9 +256,11 @@ export function formatCuesToSrt(
       ? '{\\c&H0000FF&}'
       : style?.accentColor === 'green'
         ? '{\\c&H00FF00&}'
-        : style?.accentColor === 'white'
-          ? '{\\c&HFFFFFF&}'
-          : '{\\c&H00FFFF&}';
+        : style?.accentColor === 'cyan'
+          ? '{\\c&H00FFE66D&}'
+          : style?.accentColor === 'white'
+            ? '{\\c&HFFFFFF&}'
+            : '{\\c&H00FFFF&}';
 
   const applyHighlights = (text: string): string => {
     if (highlightSet.size === 0) return text;
@@ -255,6 +280,345 @@ export function formatCuesToSrt(
       return `${idx + 1}\n${formatSrtTimestamp(safeStart)} --> ${formatSrtTimestamp(safeEnd)}\n${applyHighlights(cue.text.trim())}\n`;
     })
     .join('\n');
+}
+
+/**
+ * Formata segundos no formato de tempo ASS (H:MM:SS.cc).
+ */
+export function formatAssTimestamp(seconds: number): string {
+  const totalCs = Math.max(0, Math.round(seconds * 100));
+  const hrs = Math.floor(totalCs / 360_000);
+  const mins = Math.floor((totalCs % 360_000) / 6_000);
+  const secs = Math.floor((totalCs % 6_000) / 100);
+  const cs = totalCs % 100;
+  return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+}
+
+/**
+ * Gera legendas em formato Advanced SubStation Alpha (.ass) com estilo proprio e
+ * transicoes sutis variadas (pop, fade_slide, blur_in) preservando 100% da fala real no idioma original.
+ */
+export function formatCuesToAnimatedAss(
+  cues: readonly SpokenSubtitleCue[],
+  style?: EditorSubtitleStyle,
+): string {
+  if (cues.length === 0) return '';
+
+  const highlightSet = new Set(
+    (style?.highlightWords ?? [])
+      .map((w) => w.trim().toLowerCase())
+      .filter((w) => w.length >= 2),
+  );
+
+  const accentAssColor =
+    style?.accentColor === 'red'
+      ? '&H005A5AFF&'
+      : style?.accentColor === 'green'
+        ? '&H0088FF9E&'
+        : style?.accentColor === 'cyan'
+          ? '&H00FFE66D&'
+          : style?.accentColor === 'white'
+            ? '&H00FFFFFF&'
+            : '&H004CE8FF&';
+
+  const transitionPalette: SubtitleTransitionStyle[] =
+    style?.subtitleTransitions && style.subtitleTransitions.length > 0
+      ? style.subtitleTransitions
+      : ['pop', 'fade_slide', 'blur_in'];
+
+  const escapeAssText = (raw: string): string =>
+    raw.replace(/\\/g, '\\\\').replace(/\{/g, '(').replace(/\}/g, ')').replace(/\r?\n/g, '\\N');
+
+  const applyHighlights = (text: string): string => {
+    let out = escapeAssText(text.trim());
+    if (highlightSet.size === 0) return out;
+    for (const kw of highlightSet) {
+      const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`(${escaped})`, 'gi');
+      out = out.replace(
+        re,
+        (match) => `{\\c${accentAssColor}\\fscx106\\fscy106}${match.toUpperCase()}{\\r}`,
+      );
+    }
+    return out;
+  };
+
+  const buildTransitionTag = (kind: SubtitleTransitionStyle): string => {
+    if (kind === 'fade_slide') {
+      return '{\\an2\\move(540,1634,540,1610,0,150)\\fad(110,65)}';
+    }
+    if (kind === 'blur_in') {
+      return '{\\an2\\pos(540,1610)\\blur3.5\\t(0,120,\\blur0)\\fad(95,60)}';
+    }
+    // pop discreto
+    return '{\\an2\\pos(540,1610)\\fscx91\\fscy91\\t(0,105,\\fscx103\\fscy103)\\t(105,180,\\fscx100\\fscy100)\\fad(75,55)}';
+  };
+
+  const header = [
+    '[Script Info]',
+    'ScriptType: v4.00+',
+    'PlayResX: 1080',
+    'PlayResY: 1920',
+    'WrapStyle: 2',
+    'ScaledBorderAndShadow: yes',
+    '',
+    '[V4+ Styles]',
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+    'Style: WorkOfficeShort,DejaVu Sans,60,&H00FFFFFF,&H0000FFFF,&H00121212,&H64000000,-1,0,0,0,100,100,0.5,0,1,4,2,2,70,70,310,1',
+    '',
+    '[Events]',
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+  ];
+
+  const dialogues = cues.map((cue, idx) => {
+    const safeStart = Math.max(0, cue.startSec);
+    const safeEnd = Math.max(safeStart + 0.16, cue.endSec);
+    const txKind = transitionPalette[idx % transitionPalette.length]!;
+    const styledText = `${buildTransitionTag(txKind)}${applyHighlights(cue.text)}`;
+    return `Dialogue: 0,${formatAssTimestamp(safeStart)},${formatAssTimestamp(safeEnd)},WorkOfficeShort,,0,0,0,,${styledText}`;
+  });
+
+  return [...header, ...dialogues, ''].join('\n');
+}
+
+/**
+ * Parseia os intervalos silenciosos da saida stderr do filtro `silencedetect` do ffmpeg.
+ */
+export function parseSilenceDetectLog(stderr: string, clipDurationSec: number): SilenceInterval[] {
+  const intervals: SilenceInterval[] = [];
+  let pendingStart: number | null = null;
+
+  for (const line of stderr.split(/\r?\n/)) {
+    const startMatch = line.match(/silence_start:\s*([0-9]+(?:\.[0-9]+)?)/);
+    if (startMatch?.[1]) {
+      pendingStart = Number(startMatch[1]);
+      continue;
+    }
+    const endMatch = line.match(/silence_end:\s*([0-9]+(?:\.[0-9]+)?)/);
+    if (endMatch?.[1] && pendingStart !== null) {
+      const endSec = Math.min(clipDurationSec, Number(endMatch[1]));
+      if (endSec > pendingStart) {
+        intervals.push({ startSec: Math.max(0, pendingStart), endSec });
+      }
+      pendingStart = null;
+    }
+  }
+
+  if (pendingStart !== null && clipDurationSec > pendingStart) {
+    intervals.push({ startSec: Math.max(0, pendingStart), endSec: clipDurationSec });
+  }
+
+  return intervals;
+}
+
+/**
+ * Constroi os segmentos ativos do Short removendo pausas silenciosas >= minSilenceToCutSec,
+ * preservando um respiro natural (paddingSec) e inserindo pontos de punch-in zoom sutil (1.07x)
+ * nos momentos escolhidos pelo Editor.
+ */
+export function buildActiveEditSegments(params: {
+  clipDurationSec: number;
+  silences: readonly SilenceInterval[];
+  zoomMomentsSec?: readonly number[];
+  minSilenceToCutSec?: number;
+  paddingSec?: number;
+  maxSegments?: number;
+}): ActiveEditSegment[] {
+  const totalDur = Math.max(1, params.clipDurationSec);
+  const minCut = params.minSilenceToCutSec ?? 0.45;
+  const pad = params.paddingSec ?? 0.08;
+  const maxSegs = Math.max(2, params.maxSegments ?? 10);
+
+  // Filtra apenas pausas longas o suficiente para remover sem picotar a fala
+  const cuttable = params.silences
+    .filter((s) => s.endSec - s.startSec >= minCut)
+    .map((s) => ({
+      startSec: Math.max(0, s.startSec + pad),
+      endSec: Math.min(totalDur, s.endSec - pad),
+    }))
+    .filter((s) => s.endSec - s.startSec >= 0.25)
+    .sort((a, b) => a.startSec - b.startSec);
+
+  const kept: { startSec: number; endSec: number }[] = [];
+  let cursor = 0;
+
+  for (const sil of cuttable) {
+    if (sil.startSec > cursor + 0.35) {
+      kept.push({
+        startSec: Number(cursor.toFixed(3)),
+        endSec: Number(sil.startSec.toFixed(3)),
+      });
+    }
+    cursor = Math.max(cursor, sil.endSec);
+  }
+
+  if (totalDur - cursor >= 0.35) {
+    kept.push({
+      startSec: Number(cursor.toFixed(3)),
+      endSec: Number(totalDur.toFixed(3)),
+    });
+  }
+
+  // Garante pelo menos 1 segmento valido caso o audio inteiro seja muito baixo
+  let segments =
+    kept.length > 0 && kept.reduce((acc, s) => acc + (s.endSec - s.startSec), 0) >= 2.5
+      ? kept
+      : [{ startSec: 0, endSec: Number(totalDur.toFixed(3)) }];
+
+  // Se houver momentos especificos de zoom dentro de segmentos longos, divide suavemente para punch-in
+  const validZoomPoints = (params.zoomMomentsSec ?? [])
+    .filter((t) => Number.isFinite(t) && t >= 2.0 && t <= totalDur - 2.0)
+    .sort((a, b) => a - b)
+    .slice(0, 3);
+
+  for (const zp of validZoomPoints) {
+    if (segments.length >= maxSegs) break;
+    const idx = segments.findIndex((s) => zp > s.startSec + 1.8 && zp < s.endSec - 1.8);
+    if (idx !== -1) {
+      const target = segments[idx]!;
+      const splitAt = Number(zp.toFixed(3));
+      segments.splice(
+        idx,
+        1,
+        { startSec: target.startSec, endSec: splitAt },
+        { startSec: splitAt, endSec: target.endSec },
+      );
+    }
+  }
+
+  // Se ultrapassar maxSegs, une segmentos muito curtos adjacentes para manter o filtro leve
+  while (segments.length > maxSegs) {
+    let shortestIdx = 0;
+    let shortestDur = Infinity;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const gap = segments[i + 1]!.startSec - segments[i]!.endSec;
+      const combined = segments[i]!.endSec - segments[i]!.startSec + gap;
+      if (combined < shortestDur) {
+        shortestDur = combined;
+        shortestIdx = i;
+      }
+    }
+    const merged = {
+      startSec: segments[shortestIdx]!.startSec,
+      endSec: segments[shortestIdx + 1]!.endSec,
+    };
+    segments.splice(shortestIdx, 2, merged);
+  }
+
+  // Filtra micro-segmentos (< 0.45s) que atrapalhariam o xfade
+  segments = segments.filter((s) => s.endSec - s.startSec >= 0.45);
+  if (segments.length === 0) {
+    segments = [{ startSec: 0, endSec: Number(totalDur.toFixed(3)) }];
+  }
+
+  // Atribui punch-in sutil (1.07x) apenas em segmentos de destaque (evitando dois seguidos com zoom)
+  let prevZoomed = false;
+  return segments.map((seg, idx) => {
+    const matchesZoomMoment = validZoomPoints.some(
+      (zp) => Math.abs(seg.startSec - zp) <= 1.2 || (zp >= seg.startSec && zp <= seg.endSec),
+    );
+    const shouldZoom =
+      !prevZoomed &&
+      idx > 0 &&
+      (matchesZoomMoment || (validZoomPoints.length === 0 && idx % 3 === 1));
+    prevZoomed = shouldZoom;
+    return {
+      startSec: seg.startSec,
+      endSec: seg.endSec,
+      zoomFactor: shouldZoom ? 1.07 : 1.0,
+    };
+  });
+}
+
+/**
+ * Remapeia os timestamps das falas reais (SpokenSubtitleCue) para a nova linha do tempo
+ * resultante dos cortes de silencio + transicoes xfade entre cortes, preservando sincronia exata.
+ */
+export function remapCuesToEditSegments(
+  cues: readonly SpokenSubtitleCue[],
+  segments: readonly ActiveEditSegment[],
+  transitionSec: number,
+): { cues: SpokenSubtitleCue[]; outputDurationSec: number } {
+  if (segments.length === 0) {
+    return { cues: [...cues], outputDurationSec: 0 };
+  }
+
+  const effectiveTx = segments.length > 1 ? Math.max(0, transitionSec) : 0;
+  const segTimeline: {
+    srcStart: number;
+    srcEnd: number;
+    outStart: number;
+    outEnd: number;
+  }[] = [];
+
+  let cursor = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    const segDur = Math.max(0.1, seg.endSec - seg.startSec);
+    const outStart = i === 0 ? 0 : Math.max(0, cursor - effectiveTx);
+    const outEnd = outStart + segDur;
+    segTimeline.push({
+      srcStart: seg.startSec,
+      srcEnd: seg.endSec,
+      outStart,
+      outEnd,
+    });
+    cursor = outEnd;
+  }
+
+  const outputDurationSec = Number(cursor.toFixed(3));
+  const remapped: SpokenSubtitleCue[] = [];
+
+  for (const cue of cues) {
+    for (const seg of segTimeline) {
+      const overlapStart = Math.max(cue.startSec, seg.srcStart);
+      const overlapEnd = Math.min(cue.endSec, seg.srcEnd);
+      if (overlapEnd - overlapStart >= 0.08) {
+        const newStart = Number((seg.outStart + (overlapStart - seg.srcStart)).toFixed(3));
+        const newEnd = Number(
+          Math.min(outputDurationSec, seg.outStart + (overlapEnd - seg.srcStart)).toFixed(3),
+        );
+        if (newEnd - newStart >= 0.08) {
+          remapped.push({
+            startSec: newStart,
+            endSec: newEnd,
+            text: cue.text,
+          });
+        }
+      }
+    }
+  }
+
+  return { cues: remapped, outputDurationSec };
+}
+
+/**
+ * Executa o filtro silencedetect do ffmpeg sobre o trecho baixado para encontrar pausas sem som.
+ */
+async function detectSilentIntervalsInClip(
+  rawClipPath: string,
+  clipDurationSec: number,
+): Promise<SilenceInterval[]> {
+  try {
+    const { stderr } = await execFileAsync(
+      'ffmpeg',
+      [
+        '-hide_banner',
+        '-i',
+        rawClipPath,
+        '-af',
+        'silencedetect=noise=-32dB:d=0.45',
+        '-f',
+        'null',
+        '-',
+      ],
+      { timeout: 25_000, maxBuffer: 2 * 1024 * 1024 },
+    );
+    return parseSilenceDetectLog(stderr, clipDurationSec);
+  } catch (err) {
+    const maybeStderr = (err as { stderr?: string })?.stderr ?? '';
+    return maybeStderr ? parseSilenceDetectLog(maybeStderr, clipDurationSec) : [];
+  }
 }
 
 /**
@@ -720,15 +1084,19 @@ export function buildFfmpegVerticalShortArgs(params: {
   inputVideoPath: string;
   outputVideoPath: string;
   subtitleSrtPath?: string;
+  subtitleAssPath?: string;
   durationSec: number;
-  accentColor?: 'yellow' | 'red' | 'white' | 'green';
+  accentColor?: 'yellow' | 'red' | 'white' | 'green' | 'cyan';
   applyDynamicZoom?: boolean;
 }): string[] {
   const safeDuration = validateShortClipDuration(0, params.durationSec);
   const filters: string[] = [
-    params.applyDynamicZoom ? 'crop=ih*9/16*0.92:ih*0.92' : 'crop=ih*9/16:ih',
+    params.applyDynamicZoom ? 'crop=ih*9/16*0.93:ih*0.93' : 'crop=ih*9/16:ih',
     'scale=1080:1920:flags=lanczos',
     'setsar=1',
+    'eq=contrast=1.04:saturation=1.08:brightness=0.01',
+    'unsharp=3:3:0.3',
+    'vignette=angle=PI/5',
   ];
 
   const primaryColour =
@@ -736,14 +1104,19 @@ export function buildFfmpegVerticalShortArgs(params: {
       ? '&H00FFFFFF'
       : params.accentColor === 'white'
         ? '&H00FFFFFF'
-        : params.accentColor === 'green'
-          ? '&H0080FF80'
-          : '&H0000FFFF';
+        : params.accentColor === 'cyan'
+          ? '&H00FFE66D'
+          : params.accentColor === 'green'
+            ? '&H0080FF80'
+            : '&H0000FFFF';
 
-  if (params.subtitleSrtPath) {
+  if (params.subtitleAssPath) {
+    const escapedAss = params.subtitleAssPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    filters.push(`ass='${escapedAss}'`);
+  } else if (params.subtitleSrtPath) {
     const escapedSrt = params.subtitleSrtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
     filters.push(
-      `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=20,Bold=1,PrimaryColour=${primaryColour},OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=65'`,
+      `subtitles='${escapedSrt}':force_style='FontName=DejaVu Sans,FontSize=20,Bold=1,PrimaryColour=${primaryColour},OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=65'`,
     );
   }
 
@@ -770,6 +1143,110 @@ export function buildFfmpegVerticalShortArgs(params: {
 }
 
 /**
+ * Monta o filter_complex de edicao autoral do Agente Editor:
+ * - Recorta apenas segmentos ativos (removendo pausas silenciosas)
+ * - Aplica punch-in zoom sutil (1.07x) em momentos especificos de destaque
+ * - Aplica transicoes sutis entre cortes (xfade no video + acrossfade no audio)
+ * - Aplica assinatura visual discreta (contraste/cor/nitidez/vinheta suave)
+ * - Queima legendas .ass com transicoes variadas sincronizadas na linha do tempo pos-cortes
+ */
+export function buildFfmpegSignatureEditArgs(params: {
+  inputVideoPath: string;
+  outputVideoPath: string;
+  segments: readonly ActiveEditSegment[];
+  subtitleAssPath?: string;
+  cutTransition?: CutTransitionStyle;
+  transitionDurationSec?: number;
+}): string[] {
+  const segs = params.segments.length > 0 ? params.segments : [{ startSec: 0, endSec: 30, zoomFactor: 1 }];
+  const txStyle: CutTransitionStyle = params.cutTransition ?? 'fade';
+  const secondaryTx: CutTransitionStyle = txStyle === 'fade' ? 'dissolve' : 'fade';
+  const minSegDur = Math.min(...segs.map((s) => Math.max(0.2, s.endSec - s.startSec)));
+  const txDur =
+    segs.length > 1
+      ? Number(Math.min(params.transitionDurationSec ?? 0.14, minSegDur * 0.35).toFixed(3))
+      : 0;
+
+  const graphParts: string[] = [];
+
+  segs.forEach((seg, idx) => {
+    const z = seg.zoomFactor > 1.01 ? seg.zoomFactor : 1;
+    const cropExpr =
+      z > 1
+        ? `crop=ih*9/16/${z.toFixed(2)}:ih/${z.toFixed(2)}`
+        : 'crop=ih*9/16:ih';
+    graphParts.push(
+      `[0:v]trim=start=${seg.startSec.toFixed(3)}:end=${seg.endSec.toFixed(3)},setpts=PTS-STARTPTS,${cropExpr},scale=1080:1920:flags=lanczos,setsar=1,fps=30,format=yuv420p,eq=contrast=1.04:saturation=1.08:brightness=0.01,unsharp=3:3:0.3[v${idx}]`,
+    );
+    graphParts.push(
+      `[0:a]atrim=start=${seg.startSec.toFixed(3)}:end=${seg.endSec.toFixed(3)},asetpts=PTS-STARTPTS,aresample=44100[a${idx}]`,
+    );
+  });
+
+  let currentVideoLabel = 'v0';
+  let currentAudioLabel = 'a0';
+
+  if (segs.length > 1 && txDur >= 0.05) {
+    let runningDur = segs[0]!.endSec - segs[0]!.startSec;
+    for (let i = 1; i < segs.length; i++) {
+      const offset = Math.max(0.05, Number((runningDur - txDur).toFixed(3)));
+      const nextVideoLabel = i === segs.length - 1 ? 'vseq' : `vx${i}`;
+      const nextAudioLabel = i === segs.length - 1 ? 'aseq' : `ax${i}`;
+      const chosenTx = i % 2 === 1 ? txStyle : secondaryTx;
+
+      graphParts.push(
+        `[${currentVideoLabel}][v${i}]xfade=transition=${chosenTx}:duration=${txDur}:offset=${offset}[${nextVideoLabel}]`,
+      );
+      graphParts.push(
+        `[${currentAudioLabel}][a${i}]acrossfade=d=${txDur}:c1=tri:c2=tri[${nextAudioLabel}]`,
+      );
+
+      runningDur = runningDur + (segs[i]!.endSec - segs[i]!.startSec) - txDur;
+      currentVideoLabel = nextVideoLabel;
+      currentAudioLabel = nextAudioLabel;
+    }
+  } else if (segs.length > 1) {
+    const concatInputs = segs.map((_, i) => `[v${i}][a${i}]`).join('');
+    graphParts.push(`${concatInputs}concat=n=${segs.length}:v=1:a=1[vseq][aseq]`);
+    currentVideoLabel = 'vseq';
+    currentAudioLabel = 'aseq';
+  }
+
+  const finalPostFilters: string[] = ['vignette=angle=PI/5'];
+  if (params.subtitleAssPath) {
+    const escapedAss = params.subtitleAssPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    finalPostFilters.push(`ass='${escapedAss}'`);
+  }
+
+  graphParts.push(`[${currentVideoLabel}]${finalPostFilters.join(',')}[vout]`);
+
+  return [
+    '-y',
+    '-i',
+    params.inputVideoPath,
+    '-filter_complex',
+    graphParts.join(';'),
+    '-map',
+    '[vout]',
+    '-map',
+    `[${currentAudioLabel}]`,
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-pix_fmt',
+    'yuv420p',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+    '-movflags',
+    '+faststart',
+    params.outputVideoPath,
+  ];
+}
+
+/**
  * Gera um buffer MP4 minimo valido (ftyp + moov) quando executado em modo Sandbox/CI
  * onde binarios externos ou download real do YouTube nao estao disponiveis.
  */
@@ -785,19 +1262,70 @@ export function createMinimalValidMp4Buffer(metadataTag: string): Buffer {
   return Buffer.concat([ftyp, freeBoxHeader, tagBytes]);
 }
 
+/**
+ * Monta os argumentos reais do `ffmpeg` para capturar um frame JPEG de alta qualidade
+ * do Short renderizado para uso como thumbnail no YouTube.
+ */
+export function buildFfmpegThumbnailCaptureArgs(params: {
+  inputVideoPath: string;
+  outputThumbnailPath: string;
+  captureOffsetSec: number;
+}): string[] {
+  const safeOffset = Math.max(0, Number(params.captureOffsetSec.toFixed(2)));
+  return [
+    '-y',
+    '-ss',
+    String(safeOffset),
+    '-i',
+    params.inputVideoPath,
+    '-frames:v',
+    '1',
+    '-q:v',
+    '3',
+    params.outputThumbnailPath,
+  ];
+}
+
+/**
+ * Gera um buffer JPEG minimo valido (1x1 px) para modo Sandbox/testes quando ffmpeg nao estiver ativo.
+ */
+export function createMinimalValidJpegBuffer(): Buffer {
+  return Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48,
+    0x00, 0x48, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
+    0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
+    0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27, 0x20,
+    0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1f, 0x27,
+    0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xff, 0xc4, 0x00, 0x14,
+    0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x37, 0xff, 0xd9,
+  ]);
+}
+
 export interface RenderedShortPackage {
   mp4Buffer: Buffer;
+  thumbnailBuffer: Buffer;
   srtContent: string;
+  assContent: string;
   durationSec: number;
   resolution: '1080x1920';
   storageVideoPath: string;
   storageSubtitlePath: string;
+  storageThumbnailPath: string;
   usedNativeFfmpeg: boolean;
   subtitleCuesCount: number;
+  silencesCutCount: number;
+  editSegmentsCount: number;
+  cutTransition: CutTransitionStyle;
 }
 
 /**
- * Executa o pipeline completo de edicao de 1 Short (download -> legenda real da fala -> corte 9:16 + burn-in -> upload Storage).
+ * Executa o pipeline completo de edicao autoral de 1 Short:
+ * download -> legenda real da fala -> deteccao/corte de pausas silenciosas ->
+ * zoom pontual + transicoes sutis entre cortes + legendas ASS com transicoes variadas ->
+ * captura thumbnail -> upload Storage.
  */
 export async function renderShortVideoPackage(params: {
   officeId: string;
@@ -811,39 +1339,49 @@ export async function renderShortVideoPackage(params: {
   bodyText: string;
   spokenCues?: readonly SpokenSubtitleCue[];
   subtitleStyle?: EditorSubtitleStyle;
+  thumbnailOffsetSec?: number;
   preDownloadedRawClipPath?: string;
   supabaseStorageClient?: SupabaseClient | null;
   allowSyntheticFallback?: boolean;
 }): Promise<RenderedShortPackage> {
   validateSafeExternalUrl(params.sourceUrl);
-  const durationSec = validateShortClipDuration(params.startSec, params.endSec);
+  const rawDurationSec = validateShortClipDuration(params.startSec, params.endSec);
   const vPad = String(params.videoIndex).padStart(2, '0');
   const storageVideoPath = `${params.officeId}/${params.runId}/short_${vPad}_9x16.mp4`;
   const storageSubtitlePath = `${params.officeId}/${params.runId}/short_${vPad}.srt`;
+  const storageThumbnailPath = `${params.officeId}/${params.runId}/short_${vPad}_thumb.jpg`;
 
-  // Em producao (allowSyntheticFallback === false), JAMAIS queima hookText/bodyText (instrucoes do roteirista) como legenda!
+  // Em producao (allowSyntheticFallback === false), JAMAIS queima hookText/bodyText como legenda!
   // Usa exclusivamente as falas reais transcritas (spokenCues) no idioma original do video.
   const hasRealSpokenCues = Array.isArray(params.spokenCues) && params.spokenCues.length > 0;
-  const srtContent = hasRealSpokenCues
-    ? formatCuesToSrt(params.spokenCues!, params.subtitleStyle)
-    : params.allowSyntheticFallback === false
-      ? ''
-      : buildDynamicSrtSubtitles(params.hookText, params.bodyText, durationSec);
+  let activeCues: SpokenSubtitleCue[] = hasRealSpokenCues ? [...params.spokenCues!] : [];
+  let finalDurationSec = rawDurationSec;
+  let silencesCutCount = 0;
+  let editSegmentsCount = 1;
+  const chosenCutTransition: CutTransitionStyle = params.subtitleStyle?.cutTransition ?? 'fade';
+  const transitionDurationSec = 0.14;
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `wo-task-${params.taskId.slice(0, 8)}-`));
   const rawClipFile = params.preDownloadedRawClipPath ?? path.join(tmpDir, `raw_${vPad}.mp4`);
   const srtFile = path.join(tmpDir, `short_${vPad}.srt`);
+  const assFile = path.join(tmpDir, `short_${vPad}.ass`);
   const outMp4File = path.join(tmpDir, `short_${vPad}_9x16.mp4`);
+  const outThumbFile = path.join(tmpDir, `short_${vPad}_thumb.jpg`);
+
+  let srtContent = hasRealSpokenCues
+    ? formatCuesToSrt(activeCues, params.subtitleStyle)
+    : params.allowSyntheticFallback === false
+      ? ''
+      : buildDynamicSrtSubtitles(params.hookText, params.bodyText, rawDurationSec);
+  let assContent = hasRealSpokenCues
+    ? formatCuesToAnimatedAss(activeCues, params.subtitleStyle)
+    : '';
 
   let mp4Buffer: Buffer;
+  let thumbnailBuffer: Buffer = createMinimalValidJpegBuffer();
   let usedNativeFfmpeg = false;
 
   try {
-    const hasSubtitlesToBurn = srtContent.trim().length > 0;
-    if (hasSubtitlesToBurn) {
-      await fs.writeFile(srtFile, srtContent, 'utf8');
-    }
-
     if (process.env.ENABLE_NATIVE_FFMPEG === 'true') {
       let downloadedRealClip = false;
       let ytDlpFailureReason = '';
@@ -867,29 +1405,97 @@ export async function renderShortVideoPackage(params: {
       }
 
       if (downloadedRealClip) {
+        // 1. Detecta pausas sem som e calcula segmentos ativos + pontos de punch-in zoom sutil
+        const shouldRemoveSilences = params.subtitleStyle?.removeSilences !== false;
+        const detectedSilences = shouldRemoveSilences
+          ? await detectSilentIntervalsInClip(rawClipFile, rawDurationSec)
+          : [];
+        silencesCutCount = detectedSilences.filter((s) => s.endSec - s.startSec >= 0.45).length;
+
+        const editSegments = buildActiveEditSegments({
+          clipDurationSec: rawDurationSec,
+          silences: detectedSilences,
+          zoomMomentsSec: params.subtitleStyle?.zoomMomentsSec,
+        });
+        editSegmentsCount = editSegments.length;
+
+        // 2. Remapeia as legendas reais para a linha do tempo pos-cortes de silencio + transicoes
+        const hasMultiSegments = editSegments.length > 1;
+        const remapped = remapCuesToEditSegments(
+          activeCues,
+          editSegments,
+          hasMultiSegments ? transitionDurationSec : 0,
+        );
+        if (remapped.outputDurationSec >= 2) {
+          finalDurationSec = Math.min(60, Number(remapped.outputDurationSec.toFixed(2)));
+        }
+        if (hasRealSpokenCues && remapped.cues.length > 0) {
+          activeCues = remapped.cues;
+          srtContent = formatCuesToSrt(activeCues, params.subtitleStyle);
+          assContent = formatCuesToAnimatedAss(activeCues, params.subtitleStyle);
+        }
+
+        const hasAssToBurn = assContent.trim().length > 0;
+        const hasSrtToBurn = srtContent.trim().length > 0;
+        if (hasAssToBurn) {
+          await fs.writeFile(assFile, assContent, 'utf8');
+        }
+        if (hasSrtToBurn) {
+          await fs.writeFile(srtFile, srtContent, 'utf8');
+        }
+
+        // 3. Tenta renderizacao autoral completa (silence jump-cuts + xfade + zoom pontual + ASS animado)
         try {
-          const ffmpegArgs = buildFfmpegVerticalShortArgs({
+          const signatureArgs = buildFfmpegSignatureEditArgs({
             inputVideoPath: rawClipFile,
             outputVideoPath: outMp4File,
-            subtitleSrtPath: hasSubtitlesToBurn ? srtFile : undefined,
-            durationSec,
-            accentColor: params.subtitleStyle?.accentColor,
-            applyDynamicZoom: params.subtitleStyle?.applyDynamicZoom,
+            segments: editSegments,
+            subtitleAssPath: hasAssToBurn ? assFile : undefined,
+            cutTransition: chosenCutTransition,
+            transitionDurationSec,
           });
-          await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 60_000 });
+          await execFileAsync('ffmpeg', signatureArgs, { timeout: 90_000 });
           mp4Buffer = await fs.readFile(outMp4File);
           usedNativeFfmpeg = true;
         } catch {
-          // Se o filtro de legenda libass nao estiver compilado, recorta o video real em 9:16 sem o filtro subtitles
-          const fallbackFfmpegArgs = buildFfmpegVerticalShortArgs({
-            inputVideoPath: rawClipFile,
-            outputVideoPath: outMp4File,
-            durationSec,
-            applyDynamicZoom: params.subtitleStyle?.applyDynamicZoom,
-          });
-          await execFileAsync('ffmpeg', fallbackFfmpegArgs, { timeout: 60_000 });
-          mp4Buffer = await fs.readFile(outMp4File);
-          usedNativeFfmpeg = true;
+          // Fallback 1: corte 9:16 com assinatura visual e legendas ASS/SRT sobre a duracao original
+          if (hasRealSpokenCues) {
+            activeCues = [...params.spokenCues!];
+            srtContent = formatCuesToSrt(activeCues, params.subtitleStyle);
+            assContent = formatCuesToAnimatedAss(activeCues, params.subtitleStyle);
+            finalDurationSec = rawDurationSec;
+            if (assContent.trim().length > 0) {
+              await fs.writeFile(assFile, assContent, 'utf8');
+            }
+            if (srtContent.trim().length > 0) {
+              await fs.writeFile(srtFile, srtContent, 'utf8');
+            }
+          }
+          try {
+            const ffmpegArgs = buildFfmpegVerticalShortArgs({
+              inputVideoPath: rawClipFile,
+              outputVideoPath: outMp4File,
+              subtitleAssPath: assContent.trim().length > 0 ? assFile : undefined,
+              subtitleSrtPath: srtContent.trim().length > 0 ? srtFile : undefined,
+              durationSec: rawDurationSec,
+              accentColor: params.subtitleStyle?.accentColor,
+              applyDynamicZoom: params.subtitleStyle?.applyDynamicZoom,
+            });
+            await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 60_000 });
+            mp4Buffer = await fs.readFile(outMp4File);
+            usedNativeFfmpeg = true;
+          } catch {
+            // Fallback 2: corte 9:16 limpo sem filtro libass
+            const fallbackFfmpegArgs = buildFfmpegVerticalShortArgs({
+              inputVideoPath: rawClipFile,
+              outputVideoPath: outMp4File,
+              durationSec: rawDurationSec,
+              applyDynamicZoom: params.subtitleStyle?.applyDynamicZoom,
+            });
+            await execFileAsync('ffmpeg', fallbackFfmpegArgs, { timeout: 60_000 });
+            mp4Buffer = await fs.readFile(outMp4File);
+            usedNativeFfmpeg = true;
+          }
         }
       } else if (
         params.allowSyntheticFallback === false &&
@@ -904,7 +1510,7 @@ export async function renderShortVideoPackage(params: {
           '-f',
           'lavfi',
           '-i',
-          `color=c=0x0f172a:s=1080x1920:d=${Math.min(5, durationSec)}:r=30`,
+          `color=c=0x0f172a:s=1080x1920:d=${Math.min(5, rawDurationSec)}:r=30`,
           '-f',
           'lavfi',
           '-i',
@@ -921,14 +1527,45 @@ export async function renderShortVideoPackage(params: {
           '128k',
           '-shortest',
           '-t',
-          String(Math.min(5, durationSec)),
+          String(Math.min(5, rawDurationSec)),
           outMp4File,
         ]);
         mp4Buffer = await fs.readFile(outMp4File);
         usedNativeFfmpeg = true;
       }
+
+      // Captura um frame JPEG de alta qualidade do proprio video 9:16 renderizado para thumbnail no YouTube
+      const preferredOffset =
+        typeof params.thumbnailOffsetSec === 'number' &&
+        params.thumbnailOffsetSec >= 0.5 &&
+        params.thumbnailOffsetSec < finalDurationSec - 0.5
+          ? params.thumbnailOffsetSec
+          : Math.min(Math.max(1, finalDurationSec * 0.3), Math.max(0.5, finalDurationSec - 0.5));
+
+      const captureThumb = async (offsetSec: number): Promise<Buffer | null> => {
+        try {
+          await execFileAsync(
+            'ffmpeg',
+            buildFfmpegThumbnailCaptureArgs({
+              inputVideoPath: outMp4File,
+              outputThumbnailPath: outThumbFile,
+              captureOffsetSec: offsetSec,
+            }),
+            { timeout: 20_000 },
+          );
+          const buf = await fs.readFile(outThumbFile);
+          return buf.byteLength > 512 ? buf : null;
+        } catch {
+          return null;
+        }
+      };
+
+      const captured = (await captureThumb(preferredOffset)) ?? (await captureThumb(0.5));
+      if (captured) {
+        thumbnailBuffer = captured;
+      }
     } else {
-      mp4Buffer = createMinimalValidMp4Buffer(`${storageVideoPath} (${durationSec}s)`);
+      mp4Buffer = createMinimalValidMp4Buffer(`${storageVideoPath} (${rawDurationSec}s)`);
     }
 
     if (params.supabaseStorageClient) {
@@ -936,6 +1573,13 @@ export async function renderShortVideoPackage(params: {
         .from('shorts')
         .upload(storageVideoPath, mp4Buffer, {
           contentType: 'video/mp4',
+          upsert: true,
+        });
+
+      await params.supabaseStorageClient.storage
+        .from('shorts')
+        .upload(storageThumbnailPath, thumbnailBuffer, {
+          contentType: 'image/jpeg',
           upsert: true,
         });
 
@@ -952,12 +1596,18 @@ export async function renderShortVideoPackage(params: {
 
   return {
     mp4Buffer,
+    thumbnailBuffer,
     srtContent,
-    durationSec,
+    assContent,
+    durationSec: finalDurationSec,
     resolution: '1080x1920',
     storageVideoPath,
     storageSubtitlePath,
+    storageThumbnailPath,
     usedNativeFfmpeg,
-    subtitleCuesCount: hasRealSpokenCues ? params.spokenCues!.length : 0,
+    subtitleCuesCount: hasRealSpokenCues ? activeCues.length : 0,
+    silencesCutCount,
+    editSegmentsCount,
+    cutTransition: chosenCutTransition,
   };
 }

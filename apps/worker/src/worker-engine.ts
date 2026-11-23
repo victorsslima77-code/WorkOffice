@@ -290,6 +290,7 @@ export async function processQueuedAgentTask(
         seo_description?: string;
         seo_tags?: string[];
         storage_path?: string;
+        thumbnail_path?: string;
       }[];
     };
     const firstClip = upstreamInput.clips?.[0];
@@ -311,8 +312,8 @@ export async function processQueuedAgentTask(
       suggestedTitle: firstEdited?.suggested_title ?? firstClip?.suggested_title,
       seoDescription: firstEdited?.seo_description ?? firstClip?.seo_description,
       seoTags: firstEdited?.seo_tags ?? firstClip?.seo_tags,
+      thumbnailPath: firstEdited?.thumbnail_path,
       hookText: firstClip?.hook,
-      editingInstructions: firstClip?.subtitle_instructions ?? firstClip?.rationale,
       llmProvider: agent.provider,
       llmApiKey: apiKey,
       youtubeOAuth,

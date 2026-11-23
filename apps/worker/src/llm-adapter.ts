@@ -11,6 +11,7 @@ import {
 } from '@workoffice/shared';
 import { generateText } from 'ai';
 import { executeRegisteredTool, type ToolExecutionContext } from './tool-registry.js';
+import { fetchYoutubeAudienceHeatmap } from './tools/scriptwriter-tools.js';
 
 export interface LlmAdapterRequest {
   provider: LlmProvider;
@@ -109,11 +110,20 @@ interface ParsedScriptwriterLlmJson {
 }
 
 interface ParsedVideoEditorLlmJson {
-  subtitle_accent_color?: 'yellow' | 'red' | 'white' | 'green';
+  subtitle_accent_color?: 'yellow' | 'red' | 'white' | 'green' | 'cyan';
+  subtitle_transitions?: ('pop' | 'fade_slide' | 'blur_in')[];
+  cut_transition?: 'fade' | 'smoothleft' | 'smoothright' | 'dissolve';
   highlight_words?: string[];
+  zoom_moments_sec?: number[];
   apply_dynamic_zoom?: boolean;
+  thumbnail_offset_sec?: number;
   suggested_title?: string;
-  editing_notes?: string;
+}
+
+interface ParsedPublisherLlmJson {
+  title?: string;
+  description?: string;
+  tags?: string[];
 }
 
 function tryParseJsonFromLlmText<T = ParsedScriptwriterLlmJson>(text: string): T | null {
@@ -647,6 +657,7 @@ export async function runRoleWithMultiProviderLlm(
 
   let parsedScriptJson: ParsedScriptwriterLlmJson | null = null;
   let parsedEditorJson: ParsedVideoEditorLlmJson | null = null;
+  let parsedPublisherJson: ParsedPublisherLlmJson | null = null;
   let generatedTitleFallback: string | null = null;
 
   if (!isSandboxKey) {
@@ -666,25 +677,37 @@ export async function runRoleWithMultiProviderLlm(
         )
         .join('\n');
 
+      const peaksSummary =
+        ctx.audiencePeaks && ctx.audiencePeaks.length > 0
+          ? `Picos REAIS de audiência ("Most Replayed" do YouTube) detectados em ${ctx.sourceUrl}:\n` +
+            ctx.audiencePeaks
+              .map(
+                (p, i) =>
+                  `- Pico #${i + 1}: em ${p.peakFormatted} (${p.peakSec}s) | intensidade ${Math.round(p.intensity * 100)}% | janela recomendada em volta do pico: ${p.recommendedStartSec}s até ${p.recommendedEndSec}s`,
+              )
+              .join('\n')
+          : '';
+
       rolePrompt = [
         `Pedido do usuário: "${ctx.instruction}" (produzindo Vídeo #${vNum} de ${ctx.totalVideos}).`,
         candidatesList
           ? `Vídeos REAIS mais em alta encontrados no YouTube (ordenados por visualizações):\n${candidatesList}`
           : `URL de origem candidata: ${ctx.sourceUrl ?? 'não encontrada'}`,
+        peaksSummary,
         ctx.transcriptText
           ? `Contexto/descrição extraída do vídeo selecionado:\n${ctx.transcriptText.slice(0, 600)}`
           : '',
+        `REGRA OBRIGATÓRIA DE PICO DE AUDIÊNCIA: considere o ponto de maior pico de audiência do vídeo escolhido (ex.: se o pico foi por volta de 1:30 / 90s, o corte start_sec..end_sec DEVE envolver esse pico, começando ~10-15s antes para contexto e encerrando ~25-35s depois, mantendo duração total entre 25s e 58s).`,
         `Retorne APENAS um JSON válido (sem markdown, sem comentários) com as chaves exatas:`,
         `{`,
         `  "source_url": "<escolha a URL REAL do vídeo mais em alta e relevante da lista acima>",`,
-        `  "start_sec": <numero inteiro em segundos indicando o ponto exato de maior interesse para iniciar o corte>,`,
-        `  "end_sec": <numero inteiro em segundos, sendo end_sec - start_sec entre 25 e 58 segundos>,`,
+        `  "start_sec": <numero inteiro em segundos posicionado ~10-15s antes do pico de audiência>,`,
+        `  "end_sec": <numero inteiro em segundos após o pico de audiência, sendo end_sec - start_sec entre 25 e 58 segundos>,`,
         `  "suggested_title": "<título viral e otimizado para SEO em português para YouTube Shorts com até 85 caracteres terminando com #shorts — NUNCA repita o comando do usuário>",`,
         `  "seo_description": "<descrição completa otimizada para SEO do YouTube Shorts com palavras-chave relevantes sobre o vídeo e 4 a 6 hashtags no final incluindo #shorts>",`,
         `  "seo_tags": ["<tag1>", "<tag2>", "<8 a 15 tags de SEO altamente relevantes sobre o assunto e o criador>"],`,
         `  "hook": "<frase curta de impacto descrevendo o gancho dos 3 primeiros segundos>",`,
-        `  "subtitle_instructions": "<orientações VISUAIS sobre as legendas para o Editor: cor de destaque (amarelo, vermelho, verde ou branco), ritmo de cortes/zoom e estilo de destaque — lembrando que o Editor sempre legenda a FALA REAL do vídeo no idioma original>",`,
-        `  "rationale": "<por que este vídeo está em alta e por que o trecho start_sec..end_sec é o ponto de maior interesse para retenção>",`,
+        `  "rationale": "<por que este vídeo está em alta e qual pico de audiência (mm:ss) fundamenta o corte start_sec..end_sec>",`,
         `  "score": <nota de retenção de 75 a 99>`,
         `}`,
       ]
@@ -693,24 +716,51 @@ export async function runRoleWithMultiProviderLlm(
     } else if (req.roleSlug === 'video_editor') {
       const cuesPreview = (ctx.spokenSubtitleCues ?? []).slice(0, 45);
       const detectedLang = ctx.detectedVideoLanguage ?? 'original';
+      const clipDuration = Math.max(
+        5,
+        Math.min(60, (ctx.endSec ?? 45) - (ctx.startSec ?? 0)),
+      );
       rolePrompt = [
-        `Você é o Editor de Vídeo. A transcrição literal da FALA REAL do youtuber (${ctx.startSec ?? 0}s–${ctx.endSec ?? 45}s) JÁ foi extraída automaticamente no idioma original ("${detectedLang}") e será usada diretamente nas legendas do vídeo — NÃO reescreva nem traduza a fala.`,
-        `Orientações de estilo de legenda enviadas pelo Roteirista (APENAS para escolher cor, zoom e palavras-chave reais a destacar — JAMAIS serão inseridas como texto na legenda):`,
-        `"${ctx.editingInstructions ?? 'Manter ritmo dinâmico e legendas legíveis.'}"`,
+        `Você é o Editor de Vídeo com estilo editorial próprio e sutil (duração do corte: ${clipDuration}s).`,
+        `O pipeline já corta automaticamente pausas sem som e aplica legendas da FALA REAL no idioma original ("${detectedLang}"). NÃO escreva nem traduza legendas.`,
         cuesPreview.length > 0
-          ? `Falas REAIS transcritas do vídeo (idioma "${detectedLang}"):\n${cuesPreview.map((c) => `- ${c.text}`).join('\n')}`
+          ? `Falas REAIS transcritas do áudio do vídeo (idioma "${detectedLang}"):\n${cuesPreview.map((c) => `[${c.startSec.toFixed(1)}s] ${c.text}`).join('\n')}`
           : `Nenhuma fala foi detectada no áudio do vídeo.`,
-        `Retorne APENAS um JSON válido com as decisões VISUAIS de edição:`,
+        `Defina detalhes sutis de identidade editorial para enriquecer o Short (sem exageros visuais) retornando APENAS um JSON válido:`,
         `{`,
-        `  "subtitle_accent_color": "yellow",`,
-        `  "highlight_words": ["<escolha de 2 a 6 palavras EXATAS que aparecem literalmente nas falas acima no idioma ${detectedLang}>"],`,
-        `  "apply_dynamic_zoom": true,`,
-        `  "suggested_title": "${(ctx.suggestedTitle ?? '').replace(/"/g, "'")}",`,
-        `  "editing_notes": "<resumo curto do estilo visual aplicado (cor, zoom, palavras destacadas)>"`,
+        `  "subtitle_accent_color": "<escolha entre: yellow, cyan, green ou white>",`,
+        `  "subtitle_transitions": ["pop", "fade_slide", "blur_in"],`,
+        `  "cut_transition": "<transição discreta entre cortes: fade, smoothleft, smoothright ou dissolve>",`,
+        `  "highlight_words": ["<2 a 5 palavras EXATAS que aparecem literalmente nas falas acima no idioma ${detectedLang}>"],`,
+        `  "zoom_moments_sec": [<1 a 3 timestamps em segundos entre 2 e ${Math.max(3, clipDuration - 2)} onde aplicar um punch-in zoom sutil>],`,
+        `  "thumbnail_offset_sec": <número em segundos entre 1 e ${Math.max(2, clipDuration - 1)} indicando o melhor instante do corte para capturar a thumbnail>`,
         `}`,
       ].join('\n\n');
     } else {
-      rolePrompt = `Crie um título viral curto (máx 80 caracteres, terminando com #shorts) em português para o Vídeo #${vNum}/${ctx.totalVideos} baseado no tema "${ctx.suggestedTitle ?? ctx.instruction}". Retorne apenas o título.`;
+      const existingTags =
+        ctx.seoTags && ctx.seoTags.length > 0 ? ctx.seoTags.join(', ') : 'nenhuma ainda';
+      rolePrompt = [
+        `Você é o Publicador SEO de YouTube Shorts (Vídeo #${vNum}/${ctx.totalVideos}).`,
+        `Tema do vídeo: "${ctx.suggestedTitle ?? ctx.instruction}"`,
+        ctx.hookText ? `Gancho/Resumo do corte: "${ctx.hookText}"` : '',
+        ctx.seoDescription
+          ? `Rascunho de descrição enviado pelo Roteirista:\n${ctx.seoDescription}`
+          : '',
+        `Tags sugeridas pelo Roteirista: ${existingTags}`,
+        `Gere os metadados FINAIS otimizados para publicação PÚBLICA no YouTube Shorts.`,
+        `REGRAS OBRIGATÓRIAS:`,
+        `- NUNCA repita o comando do usuário (ex: "Crie um vídeo...") nem escreva "Short produzido pelo WorkOffice".`,
+        `- A descrição deve descrever o conteúdo real do corte em 2 a 4 linhas envolventes em português, incluir uma chamada para ação (CTA) curta e finalizar com 4 a 6 hashtags relevantes incluindo #shorts.`,
+        `- Gere entre 10 e 15 tags de SEO altamente relevantes (sem o símbolo #) sobre o criador, assunto e nicho do vídeo.`,
+        `Retorne APENAS um JSON válido (sem markdown, sem comentários) com as chaves exatas:`,
+        `{`,
+        `  "title": "<título viral SEO em português com no máximo 90 caracteres terminando com #shorts>",`,
+        `  "description": "<descrição completa otimizada para SEO do vídeo no YouTube Shorts com CTA e hashtags incluindo #shorts>",`,
+        `  "tags": ["<tag1>", "<tag2>", "<10 a 15 tags SEO relevantes sem #>"]`,
+        `}`,
+      ]
+        .filter(Boolean)
+        .join('\n\n');
     }
 
     const mainRes = await invokeLlmWithRecovery({
@@ -738,9 +788,33 @@ export async function runRoleWithMultiProviderLlm(
         generatedTitleFallback = parsedEditorJson.suggested_title.trim().slice(0, 95);
       }
     } else {
-      generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
-      if (generatedTitleFallback && !ctx.suggestedTitle) {
+      parsedPublisherJson = tryParseJsonFromLlmText<ParsedPublisherLlmJson>(rawText);
+      const parsedTitle = parsedPublisherJson?.title?.trim();
+      const parsedDesc = parsedPublisherJson?.description?.trim();
+      const parsedTags = Array.isArray(parsedPublisherJson?.tags)
+        ? Array.from(
+            new Set(
+              parsedPublisherJson.tags
+                .map((t) => String(t).replace(/^#+/, '').trim())
+                .filter((t) => t.length >= 2 && t.length <= 60),
+            ),
+          ).slice(0, 18)
+        : [];
+
+      if (parsedTitle) {
+        generatedTitleFallback = parsedTitle.slice(0, 98);
         ctx.suggestedTitle = generatedTitleFallback;
+      } else if (!ctx.suggestedTitle && !rawText.trim().startsWith('{')) {
+        generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
+        ctx.suggestedTitle = generatedTitleFallback;
+      }
+
+      if (parsedDesc && parsedDesc.length >= 20) {
+        ctx.seoDescription = parsedDesc;
+      }
+
+      if (parsedTags.length > 0) {
+        ctx.seoTags = parsedTags;
       }
     }
 
@@ -758,15 +832,12 @@ export async function runRoleWithMultiProviderLlm(
     await executeRegisteredTool('youtube_fetch_analytics', {}, ctx);
   }
 
-  // 2a fase do Editor: aplica EXCLUSIVAMENTE estilo visual (cor, zoom e destaque em palavras que EXISTEM na fala real)
-  // mantendo ctx.spokenSubtitleCues 100% IMUTAVEL (fala verbatim no idioma original) — impossivel vazar instrucoes na legenda!
+  // 2a fase do Editor: aplica estilo editorial proprio sutil (corte de silencio, transicoes variadas
+  // de legenda ASS, transicao leve entre cortes, punch-in zoom pontual) mantendo ctx.spokenSubtitleCues 100% IMUTAVEL!
   if (req.roleSlug === 'video_editor') {
-    const allowedColors = new Set(['yellow', 'red', 'white', 'green']);
-    const inferredColorFromInstructions = /vermelh|red/i.test(ctx.editingInstructions ?? '')
-      ? 'red'
-      : /verde|green/i.test(ctx.editingInstructions ?? '')
-        ? 'green'
-        : 'yellow';
+    const allowedColors = new Set(['yellow', 'red', 'white', 'green', 'cyan']);
+    const allowedSubTx = new Set(['pop', 'fade_slide', 'blur_in']);
+    const allowedCutTx = new Set(['fade', 'smoothleft', 'smoothright', 'dissolve']);
 
     const spokenTranscriptLower = (ctx.spokenSubtitleCues ?? [])
       .map((c) => c.text.toLowerCase())
@@ -780,7 +851,21 @@ export async function runRoleWithMultiProviderLlm(
               w.length >= 2 &&
               spokenTranscriptLower.includes(w.toLowerCase()),
           )
-          .slice(0, 8)
+          .slice(0, 6)
+      : [];
+
+    const verifiedSubTransitions = Array.isArray(parsedEditorJson?.subtitle_transitions)
+      ? parsedEditorJson.subtitle_transitions.filter((t): t is 'pop' | 'fade_slide' | 'blur_in' =>
+          allowedSubTx.has(String(t)),
+        )
+      : [];
+
+    const clipDur = Math.max(5, Math.min(60, (ctx.endSec ?? 45) - (ctx.startSec ?? 0)));
+    const verifiedZoomMoments = Array.isArray(parsedEditorJson?.zoom_moments_sec)
+      ? parsedEditorJson.zoom_moments_sec
+          .map((n) => Number(n))
+          .filter((n) => Number.isFinite(n) && n >= 2 && n <= clipDur - 2)
+          .slice(0, 3)
       : [];
 
     ctx.subtitleStyle = {
@@ -788,13 +873,31 @@ export async function runRoleWithMultiProviderLlm(
         parsedEditorJson?.subtitle_accent_color &&
         allowedColors.has(parsedEditorJson.subtitle_accent_color)
           ? parsedEditorJson.subtitle_accent_color
-          : inferredColorFromInstructions,
+          : 'yellow',
       highlightWords: verifiedHighlightWords,
       applyDynamicZoom:
         typeof parsedEditorJson?.apply_dynamic_zoom === 'boolean'
           ? parsedEditorJson.apply_dynamic_zoom
-          : /zoom/i.test(ctx.editingInstructions ?? ''),
+          : false,
+      subtitleTransitions:
+        verifiedSubTransitions.length > 0
+          ? verifiedSubTransitions
+          : ['pop', 'fade_slide', 'blur_in'],
+      cutTransition:
+        parsedEditorJson?.cut_transition && allowedCutTx.has(parsedEditorJson.cut_transition)
+          ? parsedEditorJson.cut_transition
+          : 'fade',
+      zoomMomentsSec: verifiedZoomMoments,
+      removeSilences: true,
     };
+
+    if (
+      typeof parsedEditorJson?.thumbnail_offset_sec === 'number' &&
+      Number.isFinite(parsedEditorJson.thumbnail_offset_sec) &&
+      parsedEditorJson.thumbnail_offset_sec >= 0.5
+    ) {
+      ctx.thumbnailOffsetSec = parsedEditorJson.thumbnail_offset_sec;
+    }
 
     await executeRegisteredTool('cut_vertical_short', {}, ctx);
     await executeRegisteredTool('burn_subtitles', {}, ctx);
@@ -822,17 +925,55 @@ export async function runRoleWithMultiProviderLlm(
       );
     }
 
-    const rawStart =
+    // Se o Roteirista escolheu um video candidato diferente do inicialmente inspecionado, busca o heatmap dele tambem
+    let activePeaks = ctx.audiencePeaks ?? [];
+    let resolvedVideoDuration = ctx.sourceDurationSec ?? 600;
+    if (!isSandboxKey && finalSourceUrl !== ctx.sourceUrl) {
+      const chosenMeta = (ctx.candidateVideos ?? []).find((v) => v.url === finalSourceUrl);
+      const chosenHeatmap = await fetchYoutubeAudienceHeatmap(
+        finalSourceUrl,
+        chosenMeta?.durationSec,
+      );
+      if (chosenHeatmap.peaks.length > 0) {
+        activePeaks = chosenHeatmap.peaks;
+      }
+      if (chosenHeatmap.durationSec) {
+        resolvedVideoDuration = chosenHeatmap.durationSec;
+      } else if (chosenMeta?.durationSec) {
+        resolvedVideoDuration = chosenMeta.durationSec;
+      }
+    }
+
+    let rawStart =
       typeof parsedScriptJson?.start_sec === 'number' && parsedScriptJson.start_sec >= 0
         ? Math.round(parsedScriptJson.start_sec)
         : (ctx.startSec ?? 30 + (vNum - 1) * 20);
 
-    const rawEnd =
+    let rawEnd =
       typeof parsedScriptJson?.end_sec === 'number' &&
         parsedScriptJson.end_sec > rawStart &&
         parsedScriptJson.end_sec - rawStart <= 60
         ? Math.round(parsedScriptJson.end_sec)
-        : Math.min(rawStart + 45, (ctx.sourceDurationSec ?? 600));
+        : Math.min(rawStart + 45, resolvedVideoDuration);
+
+    // Guardrail deterministico de pico de audiencia: se existem picos reais ("Most Replayed") no video
+    // e o intervalo escolhido pela LLM nao envolve nenhum pico real, ancora automaticamente em volta do pico!
+    if (activePeaks.length > 0) {
+      const coversAnyPeak = activePeaks.some(
+        (p) => p.peakSec >= rawStart - 5 && p.peakSec <= rawEnd + 5,
+      );
+      if (!coversAnyPeak) {
+        const targetPeak = activePeaks[(vNum - 1) % activePeaks.length]!;
+        rawStart = targetPeak.recommendedStartSec;
+        rawEnd = targetPeak.recommendedEndSec;
+        await ctx.emitVisualEvent({
+          type: 'research.read_source',
+          toolName: 'fetch_transcript',
+          progress: 85,
+          message: `Corte ajustado para envolver o pico real de audiência em ${targetPeak.peakFormatted} (${rawStart}s–${rawEnd}s).`,
+        });
+      }
+    }
 
     const finalEndSec =
       rawEnd > rawStart && rawEnd - rawStart <= 60 ? rawEnd : rawStart + 45;
@@ -868,10 +1009,6 @@ export async function runRoleWithMultiProviderLlm(
         .map((t) => `#${t.replace(/\s+/g, '')}`)
         .join(' ')} #shorts`;
 
-    const finalSubtitleInstructions =
-      parsedScriptJson?.subtitle_instructions?.trim() ||
-      'Aplicar legendas dinâmicas na fala real no idioma original do vídeo, destacando palavras-chave de impacto em amarelo vibrante e usando zoom sutil na abertura.';
-
     const finalRationale =
       parsedScriptJson?.rationale?.trim() ||
       `Trecho de maior interesse extraído de "${ctx.sourceVideoTitle ?? finalSourceUrl}" (${ctx.sourceChannelName ?? 'YouTube'}) entre ${rawStart}s e ${finalEndSec}s.`;
@@ -893,7 +1030,6 @@ export async function runRoleWithMultiProviderLlm(
           suggested_title: finalTitle,
           seo_description: finalSeoDescription,
           seo_tags: finalSeoTags,
-          subtitle_instructions: finalSubtitleInstructions,
           rationale: finalRationale,
           score: finalScore,
         },
@@ -901,17 +1037,23 @@ export async function runRoleWithMultiProviderLlm(
     };
   } else if (req.roleSlug === 'video_editor') {
     const finalDuration =
-      ctx.startSec !== undefined &&
-      ctx.endSec !== undefined &&
-      ctx.endSec > ctx.startSec &&
-      ctx.endSec - ctx.startSec <= 60
-        ? ctx.endSec - ctx.startSec
-        : 45;
+      typeof ctx.renderedDurationSec === 'number' &&
+      ctx.renderedDurationSec > 0 &&
+      ctx.renderedDurationSec <= 60
+        ? ctx.renderedDurationSec
+        : ctx.startSec !== undefined &&
+            ctx.endSec !== undefined &&
+            ctx.endSec > ctx.startSec &&
+            ctx.endSec - ctx.startSec <= 60
+          ? ctx.endSec - ctx.startSec
+          : 45;
     rawOutput = {
       edited_shorts: [
         {
           storage_path: `${ctx.officeId}/${ctx.runId}/short_${vPad}_9x16.mp4`,
           subtitle_path: `${ctx.officeId}/${ctx.runId}/short_${vPad}.srt`,
+          thumbnail_path:
+            ctx.thumbnailPath ?? `${ctx.officeId}/${ctx.runId}/short_${vPad}_thumb.jpg`,
           duration_sec: finalDuration,
           resolution: '1080x1920',
           suggested_title:
@@ -940,6 +1082,10 @@ export async function runRoleWithMultiProviderLlm(
             ctx.suggestedTitle ??
             generatedTitleFallback ??
             `Short #${vNum}/${ctx.totalVideos} #shorts`,
+          description: uploaded?.description ?? ctx.seoDescription,
+          tags: uploaded?.tags ?? ctx.seoTags,
+          thumbnail_path: uploaded?.thumbnailPath ?? ctx.thumbnailPath,
+          thumbnail_applied: uploaded?.thumbnailApplied ?? false,
           visibility: uploaded?.visibility ?? 'public',
           publication_status: uploaded?.publicationStatus ?? pubPlan.publicationStatus,
           scheduled_at: uploaded?.scheduledAt ?? pubPlan.scheduledAtIso,

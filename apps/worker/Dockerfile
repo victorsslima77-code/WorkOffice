@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    fonts-dejavu-core \
     python3 \
     python3-venv \
     python3-pip \
@@ -16,13 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && chmod a+rx /usr/local/bin/yt-dlp \
   && rm -rf /var/lib/apt/lists/*
 
-# Ambiente Python isolado com faster-whisper (transcricao local real preservando idioma original)
+# Ambiente Python isolado com faster-whisper (best-effort binary wheels; fallback automatico para yt-dlp subs + Cloud STT)
 RUN python3 -m venv /opt/venv \
-  && /opt/venv/bin/pip install --no-cache-dir faster-whisper
+  && (/opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+      && /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: faster-whisper \
+      || echo "[Dockerfile] faster-whisper wheel indisponivel; seguindo com yt-dlp subs + Cloud STT")
 ENV PATH="/opt/venv/bin:$PATH"
 ENV HF_HOME="/app/.whisper-cache"
-ENV WHISPER_MODEL_SIZE="base"
-RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')" || true
+ENV WHISPER_MODEL_SIZE="tiny"
 
 RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 

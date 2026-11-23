@@ -94,6 +94,31 @@ function parseDurationTextToSec(text?: string): number {
 }
 
 /**
+ * Converte duracao ISO-8601 da YouTube Data API v3 (ex: "PT1H2M34S", "PT12M30S", "PT55S") em segundos.
+ */
+export function parseIso8601DurationToSec(iso?: string): number | null {
+  if (!iso) return null;
+  const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/i);
+  if (!m) return null;
+  const hrs = Number(m[1] ?? 0);
+  const mins = Number(m[2] ?? 0);
+  const secs = Number(m[3] ?? 0);
+  const total = hrs * 3600 + mins * 60 + secs;
+  return total > 0 ? total : null;
+}
+
+export function formatSecondsToMmSs(seconds: number): string {
+  const safe = Math.max(0, Math.round(seconds));
+  const hrs = Math.floor(safe / 3600);
+  const mins = Math.floor((safe % 3600) / 60);
+  const secs = safe % 60;
+  if (hrs > 0) {
+    return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+/**
  * Camada 1: Busca oficial na YouTube Data API v3 usando o OAuth do Cofre do usuario (nunca sofre bloqueio de IP de datacenter).
  */
 export async function searchRealYoutubeVideosViaDataApi(
@@ -162,22 +187,36 @@ export async function searchRealYoutubeVideosViaDataApi(
       }
     }
 
-    // Enriquece com viewCount real via videos.list (custo minimo: 1 unidade) e ordena pelos mais em alta
+    // Enriquece com viewCount e duracao real via videos.list (custo minimo: 1 unidade) e ordena pelos mais em alta
     if (results.length > 0) {
       try {
         const statsRes = await fetch(
-          `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${encodeURIComponent(results.map((r) => r.videoId).join(','))}`,
+          `https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${encodeURIComponent(results.map((r) => r.videoId).join(','))}`,
           { headers: { Authorization: `Bearer ${tokenInfo.accessToken}` } },
         );
         if (statsRes.ok) {
           const statsData = (await statsRes.json()) as {
-            items?: { id?: string; statistics?: { viewCount?: string } }[];
+            items?: {
+              id?: string;
+              statistics?: { viewCount?: string };
+              contentDetails?: { duration?: string };
+            }[];
           };
-          const viewsById = new Map(
-            (statsData.items ?? []).map((it) => [it.id ?? '', Number(it.statistics?.viewCount ?? 0)]),
+          const metaById = new Map(
+            (statsData.items ?? []).map((it) => [
+              it.id ?? '',
+              {
+                views: Number(it.statistics?.viewCount ?? 0),
+                durationSec: parseIso8601DurationToSec(it.contentDetails?.duration),
+              },
+            ]),
           );
           for (const r of results) {
-            r.viewCount = viewsById.get(r.videoId) ?? 0;
+            const meta = metaById.get(r.videoId);
+            r.viewCount = meta?.views ?? 0;
+            if (meta?.durationSec) {
+              r.durationSec = meta.durationSec;
+            }
           }
           results.sort((a, b) => (b.viewCount ?? 0) - (a.viewCount ?? 0));
         }
@@ -576,6 +615,33 @@ export async function listChannelOrTopicVideos(
   ];
 }
 
+export interface HeatmapBucket {
+  startSec: number;
+  endSec: number;
+  /** Intensidade normalizada de retencao/replay do YouTube (0.0 a 1.0) */
+  intensity: number;
+}
+
+export interface AudiencePeakMoment {
+  /** Segundo central do pico de audiencia (ex: 90 = 01:30) */
+  peakSec: number;
+  /** Timestamp formatado do pico (ex: "01:30") */
+  peakFormatted: string;
+  /** Intensidade relativa do pico (0.0 a 1.0) */
+  intensity: number;
+  /** Inicio recomendado do Short (com ~15s de contexto antes do pico) */
+  recommendedStartSec: number;
+  /** Fim recomendado do Short (duracao ~45s centrada no pico, <= 58s) */
+  recommendedEndSec: number;
+}
+
+export interface YoutubeAudienceHeatmap {
+  videoId: string;
+  source: 'youtube_watch_heatmap' | 'youtube_innertube_next' | 'yt_dlp_heatmap' | 'none';
+  peaks: AudiencePeakMoment[];
+  durationSec?: number;
+}
+
 export interface TranscriptSegmentWindow {
   startSec: number;
   endSec: number;
@@ -583,36 +649,314 @@ export interface TranscriptSegmentWindow {
   transcriptText: string;
   suggestedTitle: string;
   retentionScore: number;
+  audiencePeaks: AudiencePeakMoment[];
+  heatmapSource: YoutubeAudienceHeatmap['source'];
+  resolvedDurationSec?: number;
 }
 
 /**
- * Tenta extrair descricao e legendas reais do video do YouTube (quando for um video real de 11 chars)
- * para fornecer contexto rico ao LLM Roteirista.
+ * Extrai buckets do grafico de retencao ("Most Replayed" / MARKER_TYPE_HEATMAP)
+ * de respostas JSON ou HTML do YouTube (tanto `macroMarkersListEntity` quanto `heatMarkerRenderer`).
  */
-async function fetchYoutubeVideoContextSnippet(sourceUrl: string): Promise<string | null> {
+export function parseHeatmapBucketsFromYoutubeJson(rawText: string): HeatmapBucket[] {
+  const buckets: HeatmapBucket[] = [];
+
+  // Formato 1 (moderno): {"startMillis":"90000","durationMillis":"5000","intensityScoreNormalized":0.98}
+  const modernRegex =
+    /"startMillis"\s*:\s*"?(\d+)"?\s*,\s*"durationMillis"\s*:\s*"?(\d+)"?\s*,\s*"intensityScoreNormalized"\s*:\s*([0-9.eE+-]+)/g;
+  for (const m of rawText.matchAll(modernRegex)) {
+    const startSec = Number(m[1]) / 1000;
+    const durSec = Number(m[2]) / 1000;
+    const intensity = Number(m[3]);
+    if (
+      Number.isFinite(startSec) &&
+      Number.isFinite(durSec) &&
+      durSec > 0 &&
+      Number.isFinite(intensity) &&
+      intensity >= 0
+    ) {
+      buckets.push({
+        startSec: Number(startSec.toFixed(2)),
+        endSec: Number((startSec + durSec).toFixed(2)),
+        intensity: Math.min(1, Math.max(0, intensity)),
+      });
+    }
+  }
+
+  if (buckets.length > 0) {
+    return buckets.sort((a, b) => a.startSec - b.startSec);
+  }
+
+  // Formato 2 (legado heatMarkerRenderer): timeRangeStartMillis / markerDurationMillis / heatMarkerIntensityScoreNormalized
+  const legacyRegex =
+    /"timeRangeStartMillis"\s*:\s*(\d+)\s*,\s*"markerDurationMillis"\s*:\s*(\d+)\s*,\s*"heatMarkerIntensityScoreNormalized"\s*:\s*([0-9.eE+-]+)/g;
+  for (const m of rawText.matchAll(legacyRegex)) {
+    const startSec = Number(m[1]) / 1000;
+    const durSec = Number(m[2]) / 1000;
+    const intensity = Number(m[3]);
+    if (
+      Number.isFinite(startSec) &&
+      Number.isFinite(durSec) &&
+      durSec > 0 &&
+      Number.isFinite(intensity) &&
+      intensity >= 0
+    ) {
+      buckets.push({
+        startSec: Number(startSec.toFixed(2)),
+        endSec: Number((startSec + durSec).toFixed(2)),
+        intensity: Math.min(1, Math.max(0, intensity)),
+      });
+    }
+  }
+
+  return buckets.sort((a, b) => a.startSec - b.startSec);
+}
+
+/**
+ * Seleciona os principais pontos de pico de audiencia ("Most Replayed") e calcula
+ * janelas de corte ideais de ~45s em volta de cada pico (ex: pico em 1:30 -> corte 1:15 a 2:00).
+ */
+export function selectPeakAudienceClips(
+  buckets: readonly HeatmapBucket[],
+  videoDurationSec: number,
+  maxPeaks = 3,
+): AudiencePeakMoment[] {
+  if (buckets.length === 0) return [];
+
+  const maxBucketEnd = Math.max(...buckets.map((b) => b.endSec));
+  const totalDur = Math.max(30, videoDurationSec || maxBucketEnd || 600);
+  const clipTargetDur = Math.min(45, Math.max(25, Math.floor(totalDur * 0.85)));
+  const leadInSec = Math.round(clipTargetDur * 0.33); // ~15s antes do pico para contexto/gancho
+
+  // Ignora os primeiros 5s (retencao artificial de abertura) quando o video tem mais de 45s e outros picos reais
+  const filtered =
+    totalDur > 55
+      ? buckets.filter((b) => (b.startSec + b.endSec) / 2 >= 5)
+      : [...buckets];
+  const pool = filtered.length > 0 ? filtered : [...buckets];
+
+  // Ordena por maior intensidade de audiencia
+  const ranked = [...pool].sort((a, b) => b.intensity - a.intensity);
+  const selected: AudiencePeakMoment[] = [];
+
+  for (const candidate of ranked) {
+    if (selected.length >= maxPeaks) break;
+    const peakSec = Math.round((candidate.startSec + candidate.endSec) / 2);
+
+    // Mantem picos distintos separados por pelo menos 45s para evitar cortes sobrepostos
+    if (selected.some((p) => Math.abs(p.peakSec - peakSec) < 45)) {
+      continue;
+    }
+
+    let recStart = Math.max(0, peakSec - leadInSec);
+    let recEnd = Math.min(totalDur, recStart + clipTargetDur);
+    if (recEnd - recStart < 25 && totalDur >= 25) {
+      recStart = Math.max(0, Math.round(recEnd - clipTargetDur));
+    }
+    recStart = Math.max(0, Math.round(recStart));
+    recEnd = Math.min(Math.round(totalDur), Math.round(recEnd));
+    if (recEnd <= recStart + 5) continue;
+
+    selected.push({
+      peakSec,
+      peakFormatted: formatSecondsToMmSs(peakSec),
+      intensity: Number(candidate.intensity.toFixed(3)),
+      recommendedStartSec: recStart,
+      recommendedEndSec: recEnd,
+    });
+  }
+
+  return selected;
+}
+
+/**
+ * Extrai a pagina watch do YouTube uma unica vez (trazendo descricao, duracao real e heatmap de audiencia).
+ */
+async function fetchYoutubeWatchPageSignals(sourceUrl: string): Promise<{
+  videoId: string | null;
+  description: string | null;
+  durationSec: number | null;
+  heatmapBuckets: HeatmapBucket[];
+}> {
   const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-  if (!idMatch?.[1]) return null;
+  if (!idMatch?.[1]) {
+    return { videoId: null, description: null, durationSec: null, heatmapBuckets: [] };
+  }
+  const videoId = idMatch[1];
 
   try {
-    const res = await fetch(`https://www.youtube.com/watch?v=${idMatch[1]}`, {
+    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept-Language': 'pt-BR,pt;q=0.9',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
       },
-      signal: AbortSignal.timeout(8_000),
+      signal: AbortSignal.timeout(9_000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      return { videoId, description: null, durationSec: null, heatmapBuckets: [] };
+    }
     const html = await res.text();
+    let description: string | null = null;
     const descMatch = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
     if (descMatch?.[1]) {
-      const decoded = JSON.parse(`"${descMatch[1]}"`) as string;
-      return decoded.replace(/\s+/g, ' ').trim().slice(0, 700);
+      try {
+        description = (JSON.parse(`"${descMatch[1]}"`) as string)
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 700);
+      } catch {
+        description = null;
+      }
     }
-    return null;
+
+    const lenMatch = html.match(/"lengthSeconds":"(\d+)"/);
+    const durationSec = lenMatch?.[1] ? Number(lenMatch[1]) : null;
+    const heatmapBuckets = parseHeatmapBucketsFromYoutubeJson(html);
+
+    return { videoId, description, durationSec, heatmapBuckets };
   } catch {
-    return null;
+    return { videoId, description: null, durationSec: null, heatmapBuckets: [] };
   }
+}
+
+/**
+ * Camada 2 de Heatmap: consulta o endpoint InnerTube `/youtubei/v1/next` para obter
+ * os marcadores `MARKER_TYPE_HEATMAP` (Most Replayed) diretamente do YouTube.
+ */
+async function fetchHeatmapViaInnertubeNext(videoId: string): Promise<HeatmapBucket[]> {
+  try {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/next?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion: '2.20250501.00.00',
+            hl: 'pt',
+            gl: 'BR',
+          },
+        },
+        videoId,
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) return [];
+    const text = await res.text();
+    return parseHeatmapBucketsFromYoutubeJson(text);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Camada 3 de Heatmap: consulta `yt-dlp --dump-single-json --skip-download` (disponivel no container Railway)
+ * que devolve o array `heatmap: [{ start_time, end_time, value }]` e a duracao exata do video.
+ */
+async function fetchHeatmapViaYtDlp(
+  sourceUrl: string,
+): Promise<{ buckets: HeatmapBucket[]; durationSec?: number }> {
+  try {
+    const { stdout } = await execFileAsync(
+      'yt-dlp',
+      [
+        '--no-playlist',
+        '--skip-download',
+        '--dump-single-json',
+        '--no-warnings',
+        '--extractor-args',
+        'youtube:player_client=web',
+        sourceUrl,
+      ],
+      { timeout: 15_000, maxBuffer: 6 * 1024 * 1024 },
+    );
+    const parsed = JSON.parse(stdout) as {
+      duration?: number;
+      heatmap?: { start_time?: number; end_time?: number; value?: number }[];
+    };
+    const buckets: HeatmapBucket[] = (parsed.heatmap ?? [])
+      .filter(
+        (h) =>
+          typeof h.start_time === 'number' &&
+          typeof h.end_time === 'number' &&
+          typeof h.value === 'number' &&
+          h.end_time > h.start_time,
+      )
+      .map((h) => ({
+        startSec: Number(h.start_time!.toFixed(2)),
+        endSec: Number(h.end_time!.toFixed(2)),
+        intensity: Math.min(1, Math.max(0, h.value!)),
+      }));
+    return {
+      buckets,
+      durationSec: typeof parsed.duration === 'number' ? Math.round(parsed.duration) : undefined,
+    };
+  } catch {
+    return { buckets: [] };
+  }
+}
+
+/**
+ * Busca os pontos reais de pico de audiencia ("Most Replayed") de um video do YouTube em 3 camadas:
+ * 1) HTML da pagina watch?v=<id>
+ * 2) YouTube InnerTube `/youtubei/v1/next`
+ * 3) `yt-dlp --dump-single-json`
+ */
+export async function fetchYoutubeAudienceHeatmap(
+  sourceUrl: string,
+  fallbackDurationSec?: number,
+  preFetchedWatchSignals?: {
+    videoId: string | null;
+    durationSec: number | null;
+    heatmapBuckets: HeatmapBucket[];
+  },
+): Promise<YoutubeAudienceHeatmap> {
+  const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  const videoId = preFetchedWatchSignals?.videoId ?? idMatch?.[1] ?? '';
+
+  if (!videoId || process.env.VITEST === 'true') {
+    return { videoId, source: 'none', peaks: [], durationSec: fallbackDurationSec };
+  }
+
+  const watchSignals = preFetchedWatchSignals ?? (await fetchYoutubeWatchPageSignals(sourceUrl));
+  const resolvedDur = watchSignals.durationSec ?? fallbackDurationSec ?? 600;
+
+  if (watchSignals.heatmapBuckets.length > 0) {
+    return {
+      videoId,
+      source: 'youtube_watch_heatmap',
+      peaks: selectPeakAudienceClips(watchSignals.heatmapBuckets, resolvedDur, 3),
+      durationSec: resolvedDur,
+    };
+  }
+
+  const innertubeBuckets = await fetchHeatmapViaInnertubeNext(videoId);
+  if (innertubeBuckets.length > 0) {
+    return {
+      videoId,
+      source: 'youtube_innertube_next',
+      peaks: selectPeakAudienceClips(innertubeBuckets, resolvedDur, 3),
+      durationSec: resolvedDur,
+    };
+  }
+
+  const ytdlpRes = await fetchHeatmapViaYtDlp(sourceUrl);
+  if (ytdlpRes.buckets.length > 0) {
+    const finalDur = ytdlpRes.durationSec ?? resolvedDur;
+    return {
+      videoId,
+      source: 'yt_dlp_heatmap',
+      peaks: selectPeakAudienceClips(ytdlpRes.buckets, finalDur, 3),
+      durationSec: finalDur,
+    };
+  }
+
+  return { videoId, source: 'none', peaks: [], durationSec: resolvedDur };
 }
 
 export async function extractBestTranscriptWindowForShort(
@@ -622,12 +966,38 @@ export async function extractBestTranscriptWindowForShort(
   videoMeta?: { title?: string; channelTitle?: string; durationSec?: number },
 ): Promise<TranscriptSegmentWindow> {
   validateSafeExternalUrl(sourceUrl);
-  const maxDuration = Math.max(90, videoMeta?.durationSec ?? 600);
-  const rawStart = 30 + (videoIndex - 1) * 45;
-  const startSec = Math.min(rawStart, Math.max(10, maxDuration - 55));
-  const endSec = Math.min(startSec + 45, maxDuration);
 
-  const realDesc = await fetchYoutubeVideoContextSnippet(sourceUrl);
+  const watchSignals = await fetchYoutubeWatchPageSignals(sourceUrl);
+  const heatmap = await fetchYoutubeAudienceHeatmap(
+    sourceUrl,
+    watchSignals.durationSec ?? videoMeta?.durationSec,
+    watchSignals,
+  );
+
+  const maxDuration = Math.max(
+    45,
+    heatmap.durationSec ?? watchSignals.durationSec ?? videoMeta?.durationSec ?? 600,
+  );
+
+  // Prioriza o ponto de pico de audiencia real do YouTube ("Most Replayed")!
+  // Ex.: se o pico foi por volta de 1:30 (90s), corta em volta desse trecho (75s..120s).
+  const targetPeak =
+    heatmap.peaks.length > 0
+      ? heatmap.peaks[(videoIndex - 1) % heatmap.peaks.length]
+      : undefined;
+
+  let startSec: number;
+  let endSec: number;
+  if (targetPeak) {
+    startSec = targetPeak.recommendedStartSec;
+    endSec = targetPeak.recommendedEndSec;
+  } else {
+    const rawStart = 30 + (videoIndex - 1) * 45;
+    startSec = Math.min(rawStart, Math.max(10, maxDuration - 55));
+    endSec = Math.min(startSec + 45, maxDuration);
+  }
+
+  const realDesc = watchSignals.description;
   const cleanTopic = extractCleanYoutubeSearchQuery(topic);
   const baseTitle = videoMeta?.title ? videoMeta.title.slice(0, 75) : cleanTopic.slice(0, 62);
 
@@ -641,6 +1011,11 @@ export async function extractBestTranscriptWindowForShort(
       realDesc ??
       `Trecho selecionado do vídeo "${baseTitle}" (${videoMeta?.channelTitle ?? 'YouTube'}) abordando ${cleanTopic}. Focar nos 3 primeiros segundos com corte rápido e legendas destacadas.`,
     suggestedTitle: `${baseTitle} #shorts`.slice(0, 95),
-    retentionScore: Math.min(99, 89 + (videoIndex % 10)),
+    retentionScore: targetPeak
+      ? Math.min(99, Math.max(88, Math.round(85 + targetPeak.intensity * 14)))
+      : Math.min(99, 89 + (videoIndex % 10)),
+    audiencePeaks: heatmap.peaks,
+    heatmapSource: heatmap.source,
+    resolvedDurationSec: maxDuration,
   };
 }

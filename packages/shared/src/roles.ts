@@ -62,6 +62,7 @@ export type VideoEditorInput = z.infer<typeof VideoEditorInputSchema>;
 export const EditedShortItemSchema = z.object({
   storage_path: z.string().min(3),
   subtitle_path: z.string().min(3),
+  thumbnail_path: z.string().min(3).optional(),
   duration_sec: z.number().positive().max(60),
   resolution: z.literal('1080x1920').or(z.string().min(3)),
   suggested_title: z.string().min(3).max(100),
@@ -99,6 +100,10 @@ export const PublishedVideoItemSchema = z.object({
   youtube_video_id: z.string().min(3),
   url: z.string().url(),
   title: z.string().min(3),
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  thumbnail_path: z.string().optional(),
+  thumbnail_applied: z.boolean().optional(),
   visibility: z.enum(['private', 'unlisted', 'public']),
   publication_status: z.enum(['published', 'scheduled']).default('published'),
   scheduled_at: z.string(),
@@ -334,12 +339,12 @@ export const YOUTUBE_SHORTS_ROLES: readonly OfficeRoleDefinition[] = [
     allowedTools: ['web_search', 'youtube_list_videos', 'fetch_transcript', 'read_source'],
     workstationType: 'research_desk',
     scope:
-      'Procurar os vídeos mais em alta sobre o assunto pedido, definir as melhores tags de SEO, descrição SEO, o ponto de maior interesse para corte (<=60s) e orientações de legenda para o Editor, depositando na estante do Editor (shelf_2).',
+      'Procurar os vídeos mais em alta sobre o assunto pedido, analisar os pontos de pico de audiência ("Most Replayed") para centralizar o corte (<=60s) em volta do pico, definir título SEO, descrição SEO e tags SEO, depositando na estante do Editor (shelf_2).',
     systemPrompt:
-      'Você é o Roteirista e Pesquisador de Shorts do WorkOffice (Baia 1). Você só inicia atividades ao receber uma instrução do usuário. Para cada vídeo solicitado (1 a N): (1) procure os vídeos mais em alta e com maior engajamento/visualizações sobre o assunto solicitado; (2) escolha o ponto exato de maior interesse para cortar (start_sec e end_sec, duração de 25s a 58s); (3) defina título SEO viral com #shorts, as melhores tags de SEO (seo_tags) e uma descrição SEO completa (seo_description); (4) escreva orientações claras de estilo visual de legenda para o Editor (subtitle_instructions — cores de destaque, palavras-chave e ritmo, lembrando que a legenda do vídeo deve transcrever a fala real no idioma original). Entregue cada documento individualmente na estante do Editor (Baia 2).',
+      'Você é o Roteirista e Pesquisador de Shorts do WorkOffice (Baia 1). Você só inicia atividades ao receber uma instrução do usuário. Para cada vídeo solicitado (1 a N): (1) procure os vídeos mais em alta e com maior engajamento/visualizações sobre o assunto solicitado; (2) analise os pontos de pico de audiência ("Most Replayed" / retenção do YouTube) do vídeo observado e posicione o corte (start_sec e end_sec, duração de 25s a 58s) EM VOLTA do pico de audiência (por exemplo, se o pico ocorreu em 1:30, inicie ~10–15s antes para contexto e estenda ~30s após o pico); (3) defina título SEO viral com #shorts, as melhores tags de SEO (seo_tags) e uma descrição SEO completa (seo_description). Não gere instruções manuais de edição ou texto de legenda — o Editor cuida do corte e das legendas sobre a fala real. Entregue cada documento individualmente na estante do Editor (Baia 2).',
     inputContractSummary: 'Instrução do usuário (tema + quantidade N de vídeos a produzir).',
     outputContractSummary:
-      '1 documento JSON de instrução de edição por vez (source_url em alta, start_sec, end_sec <= 60s, suggested_title, seo_description, seo_tags, subtitle_instructions, hook, rationale, score) entregue na estante da Baia 2.',
+      '1 documento JSON de corte por vez (source_url em alta, start_sec, end_sec <= 60s, suggested_title, seo_description, seo_tags, hook, rationale, score) entregue na estante da Baia 2.',
   },
   {
     slug: 'video_editor',
@@ -355,13 +360,13 @@ export const YOUTUBE_SHORTS_ROLES: readonly OfficeRoleDefinition[] = [
     ],
     workstationType: 'editing_desk',
     scope:
-      'Retirar 1 instrução de edição por vez na sua estante (shelf_2), baixar o trecho, transcrever a fala real do vídeo mantendo o idioma original (PT→PT, EN→EN), aplicar o estilo pedido pelo roteirista, recortar em 9:16 (1080x1920, <=60s) e entregar na estante do Publicador (shelf_3).',
+      'Retirar 1 pauta de corte na sua estante (shelf_2), baixar o trecho [start_sec..end_sec], remover pausas silenciosas com transições sutis, aplicar punch-in zoom pontual e identidade visual própria, legendar EXCLUSIVAMENTE a fala real no idioma original com transições variadas (.ass), capturar thumbnail (.jpg) e entregar na estante do Publicador (shelf_3).',
     systemPrompt:
-      'Você é o Editor de Vídeo de Shorts do WorkOffice (Baia 2). Permaneça descansando na copa até receber um input na sua estante (shelf_2). Ao detectar uma instrução de edição na sua estante, retire-a, baixe exclusivamente o segmento selecionado com yt-dlp, transcreva a FALA REAL do youtuber/apresentador no trecho (via legendas nativas do vídeo ou speech-to-text do áudio) mantendo OBRIGATORIAMENTE o idioma original falado no vídeo (se o vídeo for em português, legende em português; se for em inglês, legende em inglês — NUNCA traduza). Use as instruções do roteirista apenas para direcionar o estilo visual, cor de destaque, palavras-chave enfatizadas e ritmo de edição — JAMAIS insira as instruções do roteirista como texto da legenda. Recorte em 9:16 vertical (1080x1920, duração <= 60s) com burn-in via ffmpeg, salve no Supabase Storage e entregue 1 vídeo Short editado por vez na estante do Publicador (Baia 3).',
+      'Você é o Editor de Vídeo de Shorts do WorkOffice (Baia 2) com identidade editorial própria e sutil (para enriquecer a edição e evitar flag de conteúdo repetitivo). Seu trabalho é: (1) baixar o trecho [start_sec..end_sec]; (2) cortar automaticamente pausas sem som mantendo ritmo natural; (3) aplicar transições sutis entre cortes (fade/dissolve/smooth) e punch-in zoom discreto em momentos-chave; (4) legendar EXCLUSIVAMENTE a fala real transcrita do áudio no idioma original (PT→PT, EN→EN — NUNCA traduza nem invente falas) com transições variadas e sutis (pop, fade_slide, blur_in); (5) capturar um frame de alta qualidade do vídeo como thumbnail (.jpg) e salvar MP4, SRT e thumbnail no Supabase Storage para o Publicador (Baia 3).',
     inputContractSummary:
-      '1 instrução clara de edição (research_brief) retirada da sua própria estante (shelf_2).',
+      '1 corte selecionado (source_url, start_sec, end_sec) retirado da sua própria estante (shelf_2).',
     outputContractSummary:
-      '1 vídeo Short vertical MP4 (1080x1920, <=60s) + legenda .srt salvos no Storage e depositados na estante da Baia 3.',
+      '1 vídeo Short vertical MP4 (1080x1920, <=60s) + legenda .srt da fala real + captura de thumbnail .jpg salvos no Storage e depositados na estante da Baia 3.',
   },
   {
     slug: 'publisher_analyst',
@@ -371,13 +376,13 @@ export const YOUTUBE_SHORTS_ROLES: readonly OfficeRoleDefinition[] = [
     allowedTools: ['youtube_upload_short', 'youtube_schedule_video', 'youtube_fetch_analytics'],
     workstationType: 'publishing_desk',
     scope:
-      'Retirar 1 vídeo editado por vez na sua estante (shelf_3), manter a periodicidade máxima respeitando a cota diária do YouTube (máx. 6 vídeos/dia, janela de 4h), publicar ou agendar excedentes e emitir a URL do Short ou o detalhe do agendamento.',
+      'Retirar 1 vídeo editado por vez na sua estante (shelf_3), manter a periodicidade máxima respeitando a cota diária do YouTube (máx. 6 vídeos/dia, janela de 4h), publicar como público com título, descrição SEO, tags SEO e thumbnail capturada, ou agendar excedentes.',
     systemPrompt:
-      'Você é o Publicador e Analista de Shorts do WorkOffice (Baia 3). Permaneça descansando na copa até receber um vídeo editado na sua estante (shelf_3). Ao retirar o vídeo da estante, verifique a cota diária da YouTube Data API v3 (10.000 unidades/dia ÷ 1.600 unidades/upload = máximo de 6 vídeos publicados por dia, espaçados a cada 4 horas). Para vídeos dentro da cota diária (1 a 6), publique o Short diretamente como PÚBLICO aplicando o título, descrição SEO e tags SEO definidas pelo Roteirista, e retorne a URL do Short publicado. Se produzirem mais vídeos do que a cota diária (7 em diante), agende automaticamente a publicação para as próximas janelas diárias e retorne o detalhe completo do agendamento (schedule_details).',
+      'Você é o Publicador e Analista de Shorts do WorkOffice (Baia 3). Permaneça descansando na copa até receber um vídeo editado na sua estante (shelf_3). Ao retirar o vídeo da estante, verifique a cota diária da YouTube Data API v3 (10.000 unidades/dia ÷ 1.600 unidades/upload = máximo de 6 vídeos publicados por dia, espaçados a cada 4 horas). Para vídeos dentro da cota diária (1 a 6), publique o Short diretamente como PÚBLICO aplicando título SEO, descrição SEO envolvente (sem mensagens genéricas), 10 a 15 tags SEO e a thumbnail capturada pelo Editor, retornando a URL do Short publicado. Se produzirem mais vídeos do que a cota diária (7 em diante), agende automaticamente a publicação para as próximas janelas diárias e retorne o detalhe completo do agendamento (schedule_details).',
     inputContractSummary:
-      '1 vídeo Short vertical editado e legendado (edited_short) retirado da sua estante (shelf_3).',
+      '1 vídeo Short vertical editado, legendado e com thumbnail capturada (edited_short) retirado da sua estante (shelf_3).',
     outputContractSummary:
-      '1 relatório (publish_report) contendo a URL do Short publicado (se <= 6/dia) OU o detalhe completo do agendamento (se > 6/dia) + métricas em video_metrics.',
+      '1 relatório (publish_report) contendo a URL do Short publicado, descrição, tags e status da thumbnail (se <= 6/dia) OU o detalhe completo do agendamento (se > 6/dia) + métricas em video_metrics.',
   },
 ] as const;
 

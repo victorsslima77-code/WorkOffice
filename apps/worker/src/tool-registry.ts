@@ -13,6 +13,7 @@ import {
   extractBestTranscriptWindowForShort,
   listChannelOrTopicVideos,
   searchTrendingTopicsForScriptwriter,
+  type AudiencePeakMoment,
   type CandidatePodcastVideo,
 } from './tools/scriptwriter-tools.js';
 import {
@@ -46,6 +47,10 @@ export interface ToolExecutionContext {
   sourceChannelName?: string;
   sourceDurationSec?: number;
   candidateVideos?: CandidatePodcastVideo[];
+  /** Picos reais de audiencia ("Most Replayed") extraidos do grafico de retencao do YouTube */
+  audiencePeaks?: AudiencePeakMoment[];
+  /** Origem dos dados de pico de audiencia */
+  heatmapSource?: string;
   transcriptText?: string;
   /** Instrucoes de edicao do roteirista (rationale) — usadas apenas para guiar estilo/ritmo, NUNCA como texto de legenda! */
   editingInstructions?: string;
@@ -55,8 +60,16 @@ export interface ToolExecutionContext {
   spokenSubtitleCues?: SpokenSubtitleCue[];
   /** Origem da transcricao real das falas */
   subtitleSource?: string;
-  /** Estilo visual das legendas/corte derivado das instrucoes do roteirista */
+  /** Estilo visual das legendas/corte derivado exclusivamente da fala real */
   subtitleStyle?: EditorSubtitleStyle;
+  /** Offset em segundos para capturar o frame da thumbnail */
+  thumbnailOffsetSec?: number;
+  /** Caminho no Supabase Storage (bucket shorts) da thumbnail JPEG capturada pelo Editor */
+  thumbnailPath?: string;
+  /** Buffer JPEG da thumbnail capturada em memoria */
+  thumbnailBuffer?: Buffer;
+  /** Duracao final em segundos do Short apos corte de pausas silenciosas e transicoes */
+  renderedDurationSec?: number;
   /** Caminho temporario local do trecho baixado pelo yt-dlp para reutilizacao entre transcricao e ffmpeg */
   downloadedClipPath?: string;
   /** Diretorio temporario de trabalho do clipe (limpo ao final da task) */
@@ -179,6 +192,21 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
       ctx.transcriptText = transcript.transcriptText;
       ctx.suggestedTitle = transcript.suggestedTitle;
       ctx.hookText = transcript.hook;
+      ctx.audiencePeaks = transcript.audiencePeaks;
+      ctx.heatmapSource = transcript.heatmapSource;
+      if (transcript.resolvedDurationSec) {
+        ctx.sourceDurationSec = transcript.resolvedDurationSec;
+      }
+
+      if (transcript.audiencePeaks.length > 0) {
+        const mainPeak = transcript.audiencePeaks[0]!;
+        await ctx.emitVisualEvent({
+          type: 'research.read_source',
+          toolName: 'fetch_transcript',
+          progress: 72,
+          message: `Pico de audiência detectado em ${mainPeak.peakFormatted} (${Math.round(mainPeak.intensity * 100)}% Most Replayed) — corte ancorado em ${mainPeak.recommendedStartSec}s–${mainPeak.recommendedEndSec}s`,
+        });
+      }
       return transcript;
     },
   },
@@ -372,27 +400,37 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         bodyText: '',
         spokenCues: ctx.spokenSubtitleCues,
         subtitleStyle: ctx.subtitleStyle,
+        thumbnailOffsetSec: ctx.thumbnailOffsetSec,
         preDownloadedRawClipPath: ctx.downloadedClipPath,
         supabaseStorageClient: ctx.supabaseStorageClient,
         allowSyntheticFallback: Boolean(ctx.isSandbox),
       });
 
+      ctx.thumbnailPath = pkg.storageThumbnailPath;
+      ctx.thumbnailBuffer = pkg.thumbnailBuffer;
+      ctx.renderedDurationSec = pkg.durationSec;
+
       await ctx.emitVisualEvent({
         type: 'edit.render',
         toolName: 'upload_artifact',
         progress: 100,
-        message: `Short #${ctx.videoIndex}/${ctx.totalVideos} renderizado (${pkg.subtitleCuesCount} legendas • idioma ${ctx.detectedVideoLanguage ?? 'original'}) e salvo no Storage (${pkg.storageVideoPath})`,
+        message: `Short #${ctx.videoIndex}/${ctx.totalVideos} renderizado (${pkg.durationSec}s • ${pkg.silencesCutCount} pausas cortadas • ${pkg.editSegmentsCount} segmentos com transição "${pkg.cutTransition}" • ${pkg.subtitleCuesCount} legendas ASS animadas em "${ctx.detectedVideoLanguage ?? 'original'}" • thumbnail capturada) e salvo no Storage (${pkg.storageVideoPath})`,
       });
 
       return {
         storage_path: pkg.storageVideoPath,
         subtitle_path: pkg.storageSubtitlePath,
+        thumbnail_path: pkg.storageThumbnailPath,
         duration_sec: pkg.durationSec,
         resolution: pkg.resolution,
         byte_size: pkg.mp4Buffer.byteLength,
+        thumbnail_byte_size: pkg.thumbnailBuffer.byteLength,
         detected_language: ctx.detectedVideoLanguage ?? 'unknown',
         subtitle_source: ctx.subtitleSource ?? 'none',
         subtitle_cues_count: pkg.subtitleCuesCount,
+        silences_cut_count: pkg.silencesCutCount,
+        edit_segments_count: pkg.editSegmentsCount,
+        cut_transition: pkg.cutTransition,
       };
     },
   },
@@ -405,18 +443,37 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     visualEventType: 'publish.upload',
     defaultProgress: 50,
     async execute(_args, ctx) {
+      const cleanTitle =
+        ctx.suggestedTitle?.trim() || `Corte em Destaque #${ctx.videoIndex} #shorts`;
+      const seoTags =
+        ctx.seoTags && ctx.seoTags.length > 0
+          ? ctx.seoTags
+          : ['shorts', 'youtube shorts', 'cortes', 'viral'];
+      const hashtagsStr = seoTags
+        .slice(0, 5)
+        .map((t) => `#${t.replace(/[^a-zA-Z0-9À-ÿ]/g, '')}`)
+        .filter((h) => h.length > 1)
+        .join(' ');
+      const seoDescription =
+        ctx.seoDescription?.trim() ||
+        [
+          ctx.hookText?.trim() || cleanTitle.replace(/\s*#shorts/gi, '').trim(),
+          '',
+          'Curtiu esse corte? Deixe o like, comente sua opinião e inscreva-se no canal para não perder os próximos Shorts!',
+          '',
+          `${hashtagsStr} #shorts`.trim(),
+        ].join('\n');
+
       const uploaded = await uploadShortToYoutubeChannel({
         officeId: ctx.officeId,
         runId: ctx.runId,
         videoIndex: ctx.videoIndex,
-        title: ctx.suggestedTitle ?? `Vídeo #${ctx.videoIndex}/${ctx.totalVideos} — ${ctx.instruction}`,
-        description:
-          ctx.seoDescription?.trim() ||
-          (ctx.hookText
-            ? `${ctx.hookText}\n\n#shorts`
-            : `Short produzido pelo WorkOffice: ${ctx.instruction} #shorts`),
-        tags: ctx.seoTags,
+        title: cleanTitle,
+        description: seoDescription,
+        tags: seoTags,
         visibility: 'public',
+        thumbnailPath: ctx.thumbnailPath,
+        thumbnailBuffer: ctx.thumbnailBuffer,
         oauth: ctx.youtubeOAuth,
         supabaseStorageClient: ctx.supabaseStorageClient,
         allowSandboxFallback: Boolean(ctx.isSandbox),
@@ -430,7 +487,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         progress: 50,
         message:
           uploaded.publicationStatus === 'published'
-            ? `Short #${ctx.videoIndex}/${ctx.totalVideos} publicado no YouTube (${uploaded.mode}): ${uploaded.url}`
+            ? `Short #${ctx.videoIndex}/${ctx.totalVideos} publicado como ${uploaded.visibility.toUpperCase()} (${uploaded.tags.length} tags SEO • ${uploaded.thumbnailApplied ? 'thumbnail aplicada' : 'thumbnail salva'} • ${uploaded.mode}): ${uploaded.url}`
             : `Cota diária (6/dia) atingida! Short #${ctx.videoIndex}/${ctx.totalVideos} agendado: ${uploaded.outputSummary}`,
       });
 
@@ -445,17 +502,36 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     visualEventType: 'publish.upload',
     defaultProgress: 75,
     async execute(_args, ctx) {
+      const cleanTitle =
+        ctx.suggestedTitle?.trim() || `Corte em Destaque #${ctx.videoIndex} #shorts`;
+      const seoTags =
+        ctx.seoTags && ctx.seoTags.length > 0
+          ? ctx.seoTags
+          : ['shorts', 'youtube shorts', 'cortes', 'viral'];
+      const hashtagsStr = seoTags
+        .slice(0, 5)
+        .map((t) => `#${t.replace(/[^a-zA-Z0-9À-ÿ]/g, '')}`)
+        .filter((h) => h.length > 1)
+        .join(' ');
+      const seoDescription =
+        ctx.seoDescription?.trim() ||
+        `${ctx.hookText?.trim() || cleanTitle.replace(/\s*#shorts/gi, '').trim()}\n\nCurtiu o corte? Deixe o like e inscreva-se!\n\n${hashtagsStr} #shorts`;
+
       const uploaded =
         ctx.lastUploadedShort ??
         (await uploadShortToYoutubeChannel({
           officeId: ctx.officeId,
           runId: ctx.runId,
           videoIndex: ctx.videoIndex,
-          title: `Vídeo #${ctx.videoIndex}/${ctx.totalVideos} — ${ctx.instruction}`,
-          description: `Short produzido pelo WorkOffice: ${ctx.instruction} #shorts`,
-          visibility: 'private',
+          title: cleanTitle,
+          description: seoDescription,
+          tags: seoTags,
+          visibility: 'public',
+          thumbnailPath: ctx.thumbnailPath,
+          thumbnailBuffer: ctx.thumbnailBuffer,
           oauth: ctx.youtubeOAuth,
           supabaseStorageClient: ctx.supabaseStorageClient,
+          allowSandboxFallback: Boolean(ctx.isSandbox),
         }));
 
       ctx.lastUploadedShort = uploaded;
@@ -470,6 +546,8 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         publication_status: uploaded.publicationStatus,
         scheduled_at: uploaded.scheduledAt,
         visibility: uploaded.visibility,
+        description: uploaded.description,
+        tags: uploaded.tags,
         schedule_details: uploaded.scheduleDetails,
         output_summary: uploaded.outputSummary,
       };

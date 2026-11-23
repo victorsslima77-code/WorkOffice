@@ -30,6 +30,8 @@ export interface YoutubeUploadShortParams {
   visibility: 'private' | 'unlisted' | 'public';
   scheduledAtIso?: string;
   mp4Buffer?: Buffer;
+  thumbnailPath?: string;
+  thumbnailBuffer?: Buffer;
   oauth?: YoutubeOAuthCredentials | null;
   supabaseStorageClient?: SupabaseClient | null;
   allowSandboxFallback?: boolean;
@@ -39,6 +41,10 @@ export interface YoutubeUploadedShortResult {
   youtubeVideoId: string;
   url: string;
   title: string;
+  description: string;
+  tags: string[];
+  thumbnailPath?: string;
+  thumbnailApplied: boolean;
   visibility: 'private' | 'unlisted' | 'public';
   publicationStatus: 'published' | 'scheduled';
   scheduledAt: string;
@@ -128,6 +134,74 @@ async function resolvePlayableMp4BufferForUpload(
 }
 
 /**
+ * Recupera o buffer JPEG da thumbnail capturada pelo Editor (em memoria ou no bucket 'shorts' do Storage).
+ */
+async function resolveThumbnailJpegBufferForUpload(
+  params: YoutubeUploadShortParams,
+): Promise<{ buffer: Buffer | null; storagePath: string }> {
+  const vPad = String(params.videoIndex).padStart(2, '0');
+  const storagePath =
+    params.thumbnailPath?.trim() || `${params.officeId}/${params.runId}/short_${vPad}_thumb.jpg`;
+
+  if (params.thumbnailBuffer && params.thumbnailBuffer.byteLength >= 100) {
+    return { buffer: params.thumbnailBuffer, storagePath };
+  }
+
+  if (params.supabaseStorageClient) {
+    try {
+      const { data, error } = await params.supabaseStorageClient.storage
+        .from('shorts')
+        .download(storagePath);
+      if (!error && data) {
+        const arrBuf = await data.arrayBuffer();
+        const buf = Buffer.from(arrBuf);
+        if (buf.byteLength >= 100) {
+          return { buffer: buf, storagePath };
+        }
+      }
+    } catch {
+      // Segue sem thumbnail se download falhar
+    }
+  }
+
+  return { buffer: null, storagePath };
+}
+
+/**
+ * Envia a thumbnail JPEG para o video recem-publicado via YouTube Data API v3 (`thumbnails.set`).
+ * Se o canal ainda nao for verificado para thumbnails customizadas (HTTP 403), retorna false sem cancelar o video publicado.
+ */
+async function tryUploadYoutubeVideoThumbnail(params: {
+  videoId: string;
+  accessToken: string;
+  jpegBuffer: Buffer;
+}): Promise<boolean> {
+  // Limite oficial do YouTube para thumbnails: 2 MB
+  if (params.jpegBuffer.byteLength < 100 || params.jpegBuffer.byteLength > 2 * 1024 * 1024) {
+    return false;
+  }
+
+  try {
+    const thumbRes = await fetch(
+      `https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${encodeURIComponent(params.videoId)}&uploadType=media`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${params.accessToken}`,
+          'Content-Type': 'image/jpeg',
+          'Content-Length': String(params.jpegBuffer.byteLength),
+        },
+        body: new Uint8Array(params.jpegBuffer),
+        signal: AbortSignal.timeout(20_000),
+      },
+    );
+    return thumbRes.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Troca o refresh_token OAuth salvo no Supabase Vault do usuario por um access_token valido do Google,
  * utilizando o client_id e client_secret encapsulados no proprio Vault do usuario (BYOK).
  */
@@ -202,9 +276,34 @@ export async function uploadShortToYoutubeChannel(
   });
 
   const scheduledAt = params.scheduledAtIso ?? plan.scheduledAtIso;
-  const safeTitle = params.title.includes('#shorts')
+  const safeTitle = params.title.toLowerCase().includes('#shorts')
     ? params.title.slice(0, 100)
     : `${params.title.slice(0, 90)} #shorts`;
+
+  const sanitizedTags = Array.from(
+    new Set(
+      (params.tags ?? [])
+        .map((t) => String(t).replace(/^#+/, '').trim())
+        .filter((t) => t.length >= 2 && t.length <= 60),
+    ),
+  ).slice(0, 20);
+  const finalTags =
+    sanitizedTags.length > 0 ? sanitizedTags : ['shorts', 'youtube shorts', 'viral'];
+
+  const rawDesc = params.description.trim();
+  const hashtagsLine = finalTags
+    .slice(0, 5)
+    .map((t) => `#${t.replace(/[^a-zA-Z0-9À-ÿ]/g, '')}`)
+    .filter((h) => h.length > 1)
+    .join(' ');
+  const finalDescription = rawDesc
+    ? rawDesc.toLowerCase().includes('#shorts')
+      ? rawDesc.slice(0, 4900)
+      : `${rawDesc}\n\n${hashtagsLine ? `${hashtagsLine} ` : ''}#shorts`.slice(0, 4900)
+    : `${safeTitle.replace(/\s*#shorts/gi, '').trim()}\n\nCurtiu o corte? Deixe o like, comente sua opinião e inscreva-se para mais cortes!\n\n${hashtagsLine} #shorts`;
+
+  const defaultThumbPath =
+    params.thumbnailPath?.trim() || `${params.officeId}/${params.runId}/short_${vPad}_thumb.jpg`;
 
   // Quando o video excede a cota diaria (6 videos/dia), nao consome upload imediato da API hoje:
   // agenda a publicacao para a proxima janela diaria
@@ -213,6 +312,10 @@ export async function uploadShortToYoutubeChannel(
       youtubeVideoId: plan.youtubeVideoId,
       url: plan.shortUrl,
       title: safeTitle,
+      description: finalDescription,
+      tags: finalTags,
+      thumbnailPath: defaultThumbPath,
+      thumbnailApplied: false,
       visibility: 'private',
       publicationStatus: 'scheduled',
       scheduledAt,
@@ -242,11 +345,8 @@ export async function uploadShortToYoutubeChannel(
             body: JSON.stringify({
               snippet: {
                 title: safeTitle,
-                description: params.description,
-                tags:
-                  params.tags && params.tags.length > 0
-                    ? params.tags.slice(0, 20)
-                    : ['shorts', 'workoffice'],
+                description: finalDescription,
+                tags: finalTags,
                 categoryId: '22',
               },
               status: {
@@ -284,6 +384,16 @@ export async function uploadShortToYoutubeChannel(
 
           const uploaded = (await putRes.json()) as { id?: string };
           if (uploaded.id) {
+            // Aplica a thumbnail capturada pelo Editor no video publicado (YouTube Data API thumbnails.set)
+            const resolvedThumb = await resolveThumbnailJpegBufferForUpload(params);
+            const thumbnailApplied = resolvedThumb.buffer
+              ? await tryUploadYoutubeVideoThumbnail({
+                  videoId: uploaded.id,
+                  accessToken: tokenInfo.accessToken,
+                  jpegBuffer: resolvedThumb.buffer,
+                })
+              : false;
+
             const livePlan = planYoutubeShortPublication({
               videoIndex: params.videoIndex,
               alreadyPublishedTodayCount: params.alreadyPublishedTodayCount,
@@ -293,6 +403,10 @@ export async function uploadShortToYoutubeChannel(
               youtubeVideoId: uploaded.id,
               url: livePlan.shortUrl,
               title: safeTitle,
+              description: finalDescription,
+              tags: finalTags,
+              thumbnailPath: resolvedThumb.storagePath,
+              thumbnailApplied,
               visibility: params.visibility,
               publicationStatus: 'published',
               scheduledAt,
@@ -318,6 +432,10 @@ export async function uploadShortToYoutubeChannel(
     youtubeVideoId: plan.youtubeVideoId,
     url: plan.shortUrl,
     title: safeTitle,
+    description: finalDescription,
+    tags: finalTags,
+    thumbnailPath: defaultThumbPath,
+    thumbnailApplied: Boolean(params.thumbnailBuffer || params.thumbnailPath),
     visibility: params.visibility,
     publicationStatus: 'published',
     scheduledAt,

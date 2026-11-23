@@ -1,15 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildActiveEditSegments,
   buildDynamicSrtSubtitles,
+  buildFfmpegSignatureEditArgs,
+  buildFfmpegThumbnailCaptureArgs,
   buildFfmpegVerticalShortArgs,
   buildYtDlpSegmentArgs,
   ExternalUrlValidationError,
   extractBestTranscriptWindowForShort,
   fetchShortAnalyticsSnapshot,
+  formatCuesToAnimatedAss,
   formatCuesToSrt,
   formatSrtTimestamp,
+  parseHeatmapBucketsFromYoutubeJson,
+  parseIso8601DurationToSec,
+  parseSilenceDetectLog,
   parseSubtitleTextToCues,
+  remapCuesToEditSegments,
   renderShortVideoPackage,
+  selectPeakAudienceClips,
   uploadShortToYoutubeChannel,
   validateSafeExternalUrl,
 } from '../index.js';
@@ -83,22 +92,39 @@ describe('@workoffice/worker — Etapa 6 (Tools Reais de Pesquisa, Edicao 9:16/S
     expect(pkg.durationSec).toBe(52);
     expect(pkg.mp4Buffer.byteLength).toBeGreaterThan(24);
     expect(pkg.storageVideoPath).toContain('short_01_9x16.mp4');
+    expect(pkg.storageThumbnailPath).toContain('short_01_thumb.jpg');
+    expect(pkg.thumbnailBuffer.byteLength).toBeGreaterThan(100);
+
+    const thumbArgs = buildFfmpegThumbnailCaptureArgs({
+      inputVideoPath: '/tmp/out_9x16.mp4',
+      outputThumbnailPath: '/tmp/thumb.jpg',
+      captureOffsetSec: 12.5,
+    });
+    expect(thumbArgs).toContain('-frames:v');
+    expect(thumbArgs).toContain('12.5');
 
     const uploaded = await uploadShortToYoutubeChannel({
       officeId: '11111111-1111-1111-1111-111111111111',
       runId: '22222222-2222-2222-2222-222222222222',
       videoIndex: 1,
       title: 'Vídeo #1 — Novo Console',
-      description: 'Short gerado pelo WorkOffice',
-      visibility: 'private',
+      description: 'Análise completa do novo console portátil e seus destaques #shorts',
+      tags: ['console', 'games', 'shorts'],
+      visibility: 'public',
       mp4Buffer: pkg.mp4Buffer,
+      thumbnailPath: pkg.storageThumbnailPath,
+      thumbnailBuffer: pkg.thumbnailBuffer,
       oauth: {
         channelId: 'UC_test_channel',
         refreshToken: 'wo_test_youtube_refresh_123456',
       },
     });
     expect(uploaded.title).toContain('#shorts');
-    expect(uploaded.visibility).toBe('private');
+    expect(uploaded.visibility).toBe('public');
+    expect(uploaded.description).toContain('console portátil');
+    expect(uploaded.tags).toContain('games');
+    expect(uploaded.thumbnailPath).toContain('short_01_thumb.jpg');
+    expect(uploaded.thumbnailApplied).toBe(true);
     expect(uploaded.publicationStatus).toBe('published');
     expect(uploaded.outputSummary).toContain(uploaded.url);
 
@@ -173,5 +199,94 @@ Outside clip after end
     });
     expect(noSpeechPkg.srtContent).toBe('');
     expect(noSpeechPkg.srtContent).not.toContain('Abra com zoom');
+  });
+
+  it('corta pausas silenciosas, remapeia legendas sincronizadas, aplica zoom pontual, xfade e legendas ASS com transicoes variadas', () => {
+    const sampleStderr = [
+      '[silencedetect @ 0x1] silence_start: 5.200',
+      '[silencedetect @ 0x1] silence_end: 6.400 | silence_duration: 1.200',
+      '[silencedetect @ 0x1] silence_start: 14.000',
+      '[silencedetect @ 0x1] silence_end: 15.100 | silence_duration: 1.100',
+    ].join('\n');
+
+    const silences = parseSilenceDetectLog(sampleStderr, 25);
+    expect(silences).toHaveLength(2);
+    expect(silences[0]).toEqual({ startSec: 5.2, endSec: 6.4 });
+
+    const segments = buildActiveEditSegments({
+      clipDurationSec: 25,
+      silences,
+      zoomMomentsSec: [10.0],
+    });
+    // Pausas silenciosas removidas + divisao no ponto de zoom 10.0s
+    expect(segments.length).toBeGreaterThanOrEqual(3);
+    expect(segments.some((s) => s.zoomFactor > 1.01)).toBe(true);
+
+    const originalCues = [
+      { startSec: 1.0, endSec: 4.5, text: 'Fala antes da primeira pausa' },
+      { startSec: 7.0, endSec: 12.0, text: 'Fala depois do corte de silencio' },
+      { startSec: 16.0, endSec: 20.0, text: 'Trecho final com destaque' },
+    ];
+    const remapped = remapCuesToEditSegments(originalCues, segments, 0.14);
+    expect(remapped.outputDurationSec).toBeLessThan(25);
+    expect(remapped.cues.length).toBeGreaterThanOrEqual(3);
+    // O segundo trecho foi antecipado porque a pausa entre 5.2s e 6.4s foi removida
+    expect(remapped.cues[1]!.startSec).toBeLessThan(7.0);
+
+    const ass = formatCuesToAnimatedAss(remapped.cues, {
+      accentColor: 'cyan',
+      highlightWords: ['destaque'],
+      subtitleTransitions: ['pop', 'fade_slide', 'blur_in'],
+    });
+    expect(ass).toContain('[Script Info]');
+    expect(ass).toContain('PlayResX: 1080');
+    expect(ass).toContain('\\fscx91'); // pop
+    expect(ass).toContain('\\move('); // fade_slide
+    expect(ass).toContain('\\blur3.5'); // blur_in
+    expect(ass).toContain('DESTAQUE');
+
+    const sigArgs = buildFfmpegSignatureEditArgs({
+      inputVideoPath: '/tmp/raw.mp4',
+      outputVideoPath: '/tmp/out.mp4',
+      segments,
+      subtitleAssPath: '/tmp/subs.ass',
+      cutTransition: 'smoothleft',
+      transitionDurationSec: 0.14,
+    });
+    const graph = sigArgs.join(' ');
+    expect(graph).toContain('-filter_complex');
+    expect(graph).toContain('xfade=transition=smoothleft');
+    expect(graph).toContain('acrossfade=d=0.14');
+    expect(graph).toContain('eq=contrast=1.04:saturation=1.08');
+    expect(graph).toContain('vignette=angle=PI/5');
+    expect(graph).toContain("ass='/tmp/subs.ass'");
+  });
+
+  it('extrai picos de audiencia Most Replayed do YouTube e ancora o corte em volta do pico (ex: 01:30)', () => {
+    expect(parseIso8601DurationToSec('PT12M34S')).toBe(754);
+    expect(parseIso8601DurationToSec('PT1H02M05S')).toBe(3725);
+
+    const mockYoutubeHeatmapJson = JSON.stringify({
+      markers: [
+        { startMillis: '0', durationMillis: '4000', intensityScoreNormalized: 0.99 }, // abertura artificial (< 5s)
+        { startMillis: '30000', durationMillis: '5000', intensityScoreNormalized: 0.35 },
+        { startMillis: '88000', durationMillis: '4000', intensityScoreNormalized: 1.0 }, // pico real em 90s (01:30)
+        { startMillis: '180000', durationMillis: '6000', intensityScoreNormalized: 0.82 }, // segundo pico em 03:03
+      ],
+    });
+
+    const buckets = parseHeatmapBucketsFromYoutubeJson(mockYoutubeHeatmapJson);
+    expect(buckets).toHaveLength(4);
+
+    const peaks = selectPeakAudienceClips(buckets, 300, 2);
+    expect(peaks).toHaveLength(2);
+    // Pico principal em 90s (01:30) — deve gerar janela de corte envolvendo 90s (75s..120s)
+    expect(peaks[0]!.peakSec).toBe(90);
+    expect(peaks[0]!.peakFormatted).toBe('01:30');
+    expect(peaks[0]!.recommendedStartSec).toBeLessThan(90);
+    expect(peaks[0]!.recommendedEndSec).toBeGreaterThan(90);
+    expect(peaks[0]!.recommendedEndSec - peaks[0]!.recommendedStartSec).toBeLessThanOrEqual(60);
+    // Segundo pico distinto em 183s (03:03)
+    expect(peaks[1]!.peakSec).toBe(183);
   });
 });
