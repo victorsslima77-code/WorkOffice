@@ -94,6 +94,35 @@ export function calculateLlmCallCostUsd(
   return Number(cost.toFixed(6));
 }
 
+interface ParsedScriptwriterLlmJson {
+  source_url?: string;
+  start_sec?: number;
+  end_sec?: number;
+  suggested_title?: string;
+  hook?: string;
+  rationale?: string;
+  score?: number;
+}
+
+function tryParseJsonFromLlmText(text: string): ParsedScriptwriterLlmJson | null {
+  const cleaned = text
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
+    .trim();
+
+  const startIdx = cleaned.indexOf('{');
+  const endIdx = cleaned.lastIndexOf('}');
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(cleaned.slice(startIdx, endIdx + 1)) as ParsedScriptwriterLlmJson;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Executa o pipeline de ferramentas e geracao estruturada para o cargo usando o Vercel AI SDK
  * (ou o modo deterministico Sandbox quando a credencial salva no Vault for `wo_test_...`).
@@ -136,7 +165,8 @@ export async function runRoleWithMultiProviderLlm(
   const reasoningTokens =
     effortCfg.thinkingBudgetTokens > 0 ? Math.round(effortCfg.thinkingBudgetTokens * 0.35) : 0;
 
-  let customHookText = `Gancho explosivo para o Vídeo #${vNum}: ${ctx.instruction}`;
+  let parsedScriptJson: ParsedScriptwriterLlmJson | null = null;
+  let generatedTitleFallback: string | null = null;
 
   if (!isSandboxKey) {
     try {
@@ -147,24 +177,74 @@ export async function runRoleWithMultiProviderLlm(
             ? createGoogleGenerativeAI({ apiKey: req.apiKey })(req.model)
             : createOpenAI({ apiKey: req.apiKey })(req.model);
 
+      // Garante que maxTokens seja sempre MAIOR que thinkingBudgetTokens (exigido por Gemini 2.5 e Claude Thinking!)
+      const effectiveMaxTokens = Math.max(
+        effortCfg.maxOutputTokens,
+        effortCfg.thinkingBudgetTokens + 2048,
+      );
+
+      let rolePrompt: string;
+      if (req.roleSlug === 'scriptwriter') {
+        const candidatesList = (ctx.candidateVideos ?? [])
+          .slice(0, 5)
+          .map(
+            (v, i) =>
+              `${i + 1}. URL: ${v.url} | Título Original: "${v.title}" | Canal: ${v.channelTitle} | Duração: ${v.durationSec}s${v.description ? ` | Resumo: ${v.description.slice(0, 140)}` : ''}`,
+          )
+          .join('\n');
+
+        rolePrompt = [
+          `Pedido do usuário: "${ctx.instruction}" (produzindo Vídeo #${vNum} de ${ctx.totalVideos}).`,
+          candidatesList
+            ? `Vídeos REAIS encontrados no YouTube:\n${candidatesList}`
+            : `URL de origem candidata: ${ctx.sourceUrl ?? 'não encontrada'}`,
+          ctx.transcriptText
+            ? `Contexto/descrição extraída do vídeo selecionado:\n${ctx.transcriptText.slice(0, 600)}`
+            : '',
+          `Retorne APENAS um JSON válido (sem markdown, sem comentários) com as chaves exatas:`,
+          `{`,
+          `  "source_url": "<escolha uma URL REAL da lista acima>",`,
+          `  "start_sec": <numero inteiro em segundos, dentro da duracao do video>,`,
+          `  "end_sec": <numero inteiro em segundos, sendo end_sec - start_sec entre 25 e 58 segundos>,`,
+          `  "suggested_title": "<título viral, chamativo e natural em português para YouTube Shorts com até 85 caracteres terminando com #shorts — NUNCA repita o comando do usuário>",`,
+          `  "hook": "<frase curta de impacto para os 3 primeiros segundos do Short que prende a atenção>",`,
+          `  "rationale": "<instruções claras e detalhadas para o Editor: por que esse trecho retém audiência, ritmo de cortes, zoom e quais palavras destacar na legenda>",`,
+          `  "score": <nota de retenção de 75 a 99>`,
+          `}`,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      } else {
+        rolePrompt = `Crie um título viral curto (máx 80 caracteres, terminando com #shorts) em português para o Vídeo #${vNum}/${ctx.totalVideos} baseado no tema "${ctx.suggestedTitle ?? ctx.instruction}". Retorne apenas o título.`;
+      }
+
       const llmRes = await generateText({
         model: providerModel,
         system: req.systemPrompt,
-        prompt: `Gere uma frase curta de gancho/titulo para o Vídeo #${vNum} de ${ctx.totalVideos} sobre: "${ctx.instruction}"`,
-        maxTokens: Math.min(256, effortCfg.maxOutputTokens),
+        prompt: rolePrompt,
+        maxTokens: effectiveMaxTokens,
         providerOptions: buildProviderSpecificOptions(req.provider, req.model, req.effort) as never,
         abortSignal: ctx.abortSignal,
       });
 
-      if (llmRes.text.trim()) {
-        customHookText = llmRes.text.trim().slice(0, 95);
+      const rawText = llmRes.text.trim();
+      if (rawText) {
+        if (req.roleSlug === 'scriptwriter') {
+          parsedScriptJson = tryParseJsonFromLlmText(rawText);
+        } else {
+          generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
+        }
       }
+
       if (llmRes.usage) {
         inputTokens = llmRes.usage.promptTokens || inputTokens;
         outputTokens = llmRes.usage.completionTokens || outputTokens;
       }
-    } catch {
-      // Caso a chave externa falhe por rede/cota, preserva o output estruturado das tools ou lanca se abortado
+    } catch (err) {
+      console.error(
+        `[WorkOffice LLM] Falha ao chamar ${req.provider}/${req.model}:`,
+        (err as Error).message,
+      );
       if (ctx.abortSignal?.aborted) {
         throw new Error('Chamada LLM cancelada pelo usuario.');
       }
@@ -174,30 +254,90 @@ export async function runRoleWithMultiProviderLlm(
   // Monta o output estruturado para 1 unico video por vez, compativel com o schema Zod do cargo
   let rawOutput: unknown;
   if (req.roleSlug === 'scriptwriter') {
-    const startSec = ctx.startSec ?? 30 + (vNum - 1) * 20;
-    const endSec = ctx.endSec ?? startSec + 45;
+    const validCandidateUrls = new Set((ctx.candidateVideos ?? []).map((v) => v.url));
+    const llmChosenUrl =
+      parsedScriptJson?.source_url &&
+      (validCandidateUrls.size === 0 || validCandidateUrls.has(parsedScriptJson.source_url))
+        ? parsedScriptJson.source_url
+        : undefined;
+
+    const finalSourceUrl =
+      llmChosenUrl ?? ctx.sourceUrl ?? `https://www.youtube.com/watch?v=source_${vPad}`;
+
+    const rawStart =
+      typeof parsedScriptJson?.start_sec === 'number' && parsedScriptJson.start_sec >= 0
+        ? Math.round(parsedScriptJson.start_sec)
+        : (ctx.startSec ?? 30 + (vNum - 1) * 20);
+
+    const rawEnd =
+      typeof parsedScriptJson?.end_sec === 'number' &&
+      parsedScriptJson.end_sec > rawStart &&
+      parsedScriptJson.end_sec - rawStart <= 60
+        ? Math.round(parsedScriptJson.end_sec)
+        : Math.min(rawStart + 45, (ctx.sourceDurationSec ?? 600));
+
+    const finalEndSec =
+      rawEnd > rawStart && rawEnd - rawStart <= 60 ? rawEnd : rawStart + 45;
+
+    const defaultRealTitle = ctx.sourceVideoTitle
+      ? `${ctx.sourceVideoTitle.slice(0, 78)} #shorts`
+      : (ctx.suggestedTitle ?? `Corte Viral #${vNum} #shorts`);
+
+    const finalTitleRaw = parsedScriptJson?.suggested_title?.trim() || defaultRealTitle;
+    const finalTitle = finalTitleRaw.toLowerCase().includes('#shorts')
+      ? finalTitleRaw.slice(0, 98)
+      : `${finalTitleRaw.slice(0, 88)} #shorts`;
+
+    const finalHook =
+      parsedScriptJson?.hook?.trim() ||
+      ctx.hookText ||
+      (ctx.sourceVideoTitle
+        ? `Você viu esse momento de "${ctx.sourceVideoTitle.slice(0, 65)}"?`
+        : `O momento mais insano desse vídeo!`);
+
+    const finalRationale =
+      parsedScriptJson?.rationale?.trim() ||
+      `Corte vertical 9:16 extraído de "${ctx.sourceVideoTitle ?? finalSourceUrl}" (${ctx.sourceChannelName ?? 'YouTube'}) entre ${rawStart}s e ${finalEndSec}s. Destacar o gancho inicial nos 3 primeiros segundos, aplicar cortes dinâmicos e queimar legendas amarelas sincronizadas.`;
+
+    const finalScore =
+      typeof parsedScriptJson?.score === 'number' &&
+      parsedScriptJson.score >= 0 &&
+      parsedScriptJson.score <= 100
+        ? Math.round(parsedScriptJson.score)
+        : Math.min(99, 89 + (vNum % 10));
+
     rawOutput = {
       clips: [
         {
-          source_url: ctx.sourceUrl ?? `https://www.youtube.com/watch?v=source_${vPad}`,
-          start_sec: startSec,
-          end_sec: endSec,
-          hook: customHookText,
-          suggested_title: `${customHookText.slice(0, 75)} #shorts`,
-          rationale: `Instrução clara de edição para o Vídeo #${vNum}/${ctx.totalVideos} sobre "${ctx.instruction}".`,
-          score: Math.min(99, 88 + (vNum % 10)),
+          source_url: finalSourceUrl,
+          start_sec: rawStart,
+          end_sec: finalEndSec,
+          hook: finalHook,
+          suggested_title: finalTitle,
+          rationale: finalRationale,
+          score: finalScore,
         },
       ],
     };
   } else if (req.roleSlug === 'video_editor') {
+    const finalDuration =
+      ctx.startSec !== undefined &&
+      ctx.endSec !== undefined &&
+      ctx.endSec > ctx.startSec &&
+      ctx.endSec - ctx.startSec <= 60
+        ? ctx.endSec - ctx.startSec
+        : 45;
     rawOutput = {
       edited_shorts: [
         {
           storage_path: `${ctx.officeId}/${ctx.runId}/short_${vPad}_9x16.mp4`,
           subtitle_path: `${ctx.officeId}/${ctx.runId}/short_${vPad}.srt`,
-          duration_sec: 52,
+          duration_sec: finalDuration,
           resolution: '1080x1920',
-          suggested_title: `Vídeo #${vNum}/${ctx.totalVideos} — ${ctx.instruction.slice(0, 60)} #shorts`,
+          suggested_title:
+            ctx.suggestedTitle ??
+            generatedTitleFallback ??
+            `Short #${vNum}/${ctx.totalVideos} #shorts`,
         },
       ],
     };
@@ -215,7 +355,9 @@ export async function runRoleWithMultiProviderLlm(
           url: uploaded?.url ?? pubPlan.shortUrl,
           title:
             uploaded?.title ??
-            `Vídeo #${vNum}/${ctx.totalVideos} — ${ctx.instruction.slice(0, 60)} #shorts`,
+            ctx.suggestedTitle ??
+            generatedTitleFallback ??
+            `Short #${vNum}/${ctx.totalVideos} #shorts`,
           visibility: uploaded?.visibility ?? 'private',
           publication_status: uploaded?.publicationStatus ?? pubPlan.publicationStatus,
           scheduled_at: uploaded?.scheduledAt ?? pubPlan.scheduledAtIso,

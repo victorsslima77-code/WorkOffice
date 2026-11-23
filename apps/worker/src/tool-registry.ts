@@ -10,6 +10,7 @@ import {
   extractBestTranscriptWindowForShort,
   listChannelOrTopicVideos,
   searchTrendingTopicsForScriptwriter,
+  type CandidatePodcastVideo,
 } from './tools/scriptwriter-tools.js';
 import {
   buildDynamicSrtSubtitles,
@@ -34,6 +35,13 @@ export interface ToolExecutionContext {
   totalVideos: number;
   instruction: string;
   sourceUrl?: string;
+  sourceVideoTitle?: string;
+  sourceChannelName?: string;
+  sourceDurationSec?: number;
+  candidateVideos?: CandidatePodcastVideo[];
+  transcriptText?: string;
+  suggestedTitle?: string;
+  hookText?: string;
   startSec?: number;
   endSec?: number;
   youtubeOAuth?: YoutubeOAuthCredentials | null;
@@ -72,7 +80,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         progress: 25,
         message: `Pesquisando tendências para Vídeo #${ctx.videoIndex}/${ctx.totalVideos}: "${query}"`,
       });
-      return searchTrendingTopicsForScriptwriter(query, ctx.videoIndex);
+      return searchTrendingTopicsForScriptwriter(query, ctx.videoIndex, ctx.youtubeOAuth);
     },
   },
 
@@ -87,11 +95,20 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         type: 'research.web_search',
         toolName: 'youtube_list_videos',
         progress: 45,
-        message: `Listando vídeos candidatos em ${channelUrl} (Vídeo #${ctx.videoIndex}/${ctx.totalVideos})`,
+        message: `Buscando vídeos reais no YouTube sobre "${ctx.instruction}" (Vídeo #${ctx.videoIndex}/${ctx.totalVideos})`,
       });
-      const videos = await listChannelOrTopicVideos(channelUrl, ctx.instruction, ctx.videoIndex);
-      if (videos[0]?.url) {
+      const videos = await listChannelOrTopicVideos(
+        channelUrl,
+        ctx.instruction,
+        ctx.videoIndex,
+        ctx.youtubeOAuth,
+      );
+      ctx.candidateVideos = videos;
+      if (videos[0]) {
         ctx.sourceUrl = videos[0].url;
+        ctx.sourceVideoTitle = videos[0].title;
+        ctx.sourceChannelName = videos[0].channelTitle;
+        ctx.sourceDurationSec = videos[0].durationSec;
       }
       return { videos };
     },
@@ -112,16 +129,24 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         type: 'research.read_source',
         toolName: 'fetch_transcript',
         progress: 65,
-        message: `Extraindo transcrição e timestamps para o Vídeo #${ctx.videoIndex}/${ctx.totalVideos} (${sourceUrl})`,
+        message: `Extraindo contexto e timestamps de "${ctx.sourceVideoTitle ?? sourceUrl}" (Vídeo #${ctx.videoIndex}/${ctx.totalVideos})`,
       });
       const transcript = await extractBestTranscriptWindowForShort(
         sourceUrl,
         ctx.instruction,
         ctx.videoIndex,
+        {
+          title: ctx.sourceVideoTitle,
+          channelTitle: ctx.sourceChannelName,
+          durationSec: ctx.sourceDurationSec,
+        },
       );
       ctx.sourceUrl = sourceUrl;
       ctx.startSec = transcript.startSec;
       ctx.endSec = transcript.endSec;
+      ctx.transcriptText = transcript.transcriptText;
+      ctx.suggestedTitle = transcript.suggestedTitle;
+      ctx.hookText = transcript.hook;
       return transcript;
     },
   },
@@ -237,8 +262,10 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         sourceUrl,
         startSec,
         endSec,
-        hookText: `Vídeo #${ctx.videoIndex}: ${ctx.instruction}`,
-        bodyText: `Corte vertical 9:16 com legendas sincronizadas para ${ctx.instruction}.`,
+        hookText: ctx.hookText ?? `Vídeo #${ctx.videoIndex}: ${ctx.instruction}`,
+        bodyText:
+          ctx.transcriptText ??
+          `Corte vertical 9:16 com legendas sincronizadas para ${ctx.instruction}.`,
         supabaseStorageClient: ctx.supabaseStorageClient,
       });
 
@@ -271,8 +298,11 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         officeId: ctx.officeId,
         runId: ctx.runId,
         videoIndex: ctx.videoIndex,
-        title: `Vídeo #${ctx.videoIndex}/${ctx.totalVideos} — ${ctx.instruction}`,
-        description: `Short produzido e publicado automaticamente pelo WorkOffice: ${ctx.instruction} #shorts`,
+        title: ctx.suggestedTitle ?? `Vídeo #${ctx.videoIndex}/${ctx.totalVideos} — ${ctx.instruction}`,
+        description:
+          ctx.hookText
+            ? `${ctx.hookText}\n\nProduzido automaticamente pelo WorkOffice #shorts`
+            : `Short produzido e publicado automaticamente pelo WorkOffice: ${ctx.instruction} #shorts`,
         visibility: 'private',
         oauth: ctx.youtubeOAuth,
         supabaseStorageClient: ctx.supabaseStorageClient,

@@ -25,7 +25,10 @@ import {
   ArtifactPreviewModal,
   type PreviewableArtifact,
 } from './artifact-preview-modal';
-import OfficeGameCanvas, { type ActiveAgentVisualState } from './office-game-canvas';
+import OfficeGameCanvas, {
+  type ActiveAgentVisualState,
+  type CanvasVisualCommand,
+} from './office-game-canvas';
 import {
   OfficeObservabilityPanel,
   type TraceTaskItem,
@@ -166,6 +169,7 @@ export function OfficeInteractiveStage({
   });
 
   const [feed, setFeed] = useState<FeedEventItem[]>([]);
+  const [visualCommandLog, setVisualCommandLog] = useState<CanvasVisualCommand[]>([]);
   const [syntheticCalls, setSyntheticCalls] = useState<LlmCallTelemetryRow[]>([]);
   const [syntheticTasks, setSyntheticTasks] = useState<TraceTaskItem[]>([]);
   const [pausedBudgetAgentIds, setPausedBudgetAgentIds] = useState<Record<string, boolean>>({});
@@ -366,17 +370,26 @@ export function OfficeInteractiveStage({
           if (!ag) return;
 
           setLastSyncedEventId(ev.id);
+          const nextVisualState: ActiveAgentVisualState = {
+            eventType: ev.type,
+            message: ev.payload?.message ?? ev.type,
+            progress: ev.payload?.progress,
+            targetDeskSlot: ev.payload?.targetDeskSlot,
+            videoNumber: ev.payload?.videoNumber,
+            totalVideos: ev.payload?.totalVideos,
+          };
           setActiveStates((prev) => ({
             ...prev,
-            [ev.agent_id]: {
-              eventType: ev.type,
-              message: ev.payload?.message ?? ev.type,
-              progress: ev.payload?.progress,
-              targetDeskSlot: ev.payload?.targetDeskSlot,
-              videoNumber: ev.payload?.videoNumber,
-              totalVideos: ev.payload?.totalVideos,
-            },
+            [ev.agent_id]: nextVisualState,
           }));
+          setVisualCommandLog((prev) => [
+            ...prev.slice(-199),
+            {
+              commandId: `rt_${ev.id}`,
+              agentId: ev.agent_id,
+              ...nextVisualState,
+            },
+          ]);
 
           const timeStr = new Date(ev.created_at || Date.now()).toLocaleTimeString('pt-BR', {
             hour: '2-digit',
@@ -593,17 +606,26 @@ export function OfficeInteractiveStage({
       const ev = replayHistory[nextIdx];
       if (ev) {
         setReplayCursor(nextIdx);
+        const replayVisualState: ActiveAgentVisualState = {
+          eventType: ev.type,
+          message: `[REPLAY] ${ev.payload?.message ?? ev.type}`,
+          progress: ev.payload?.progress,
+          targetDeskSlot: ev.payload?.targetDeskSlot,
+          videoNumber: ev.payload?.videoNumber,
+          totalVideos: ev.payload?.totalVideos,
+        };
         setActiveStates((prev) => ({
           ...prev,
-          [ev.agent_id]: {
-            eventType: ev.type,
-            message: `[REPLAY] ${ev.payload?.message ?? ev.type}`,
-            progress: ev.payload?.progress,
-            targetDeskSlot: ev.payload?.targetDeskSlot,
-            videoNumber: ev.payload?.videoNumber,
-            totalVideos: ev.payload?.totalVideos,
-          },
+          [ev.agent_id]: replayVisualState,
         }));
+        setVisualCommandLog((prev) => [
+          ...prev.slice(-199),
+          {
+            commandId: `replay_${ev.id}_${nextIdx}`,
+            agentId: ev.agent_id,
+            ...replayVisualState,
+          },
+        ]);
       }
     }, delay);
 
@@ -626,17 +648,27 @@ export function OfficeInteractiveStage({
       return;
     }
 
+    const actionVisualState: ActiveAgentVisualState = {
+      eventType: action.type,
+      message: action.message,
+      progress: action.progress,
+      targetDeskSlot: action.targetDeskSlot,
+      videoNumber: action.videoNumber,
+      totalVideos: action.totalVideos,
+    };
+
     setActiveStates((prev) => ({
       ...prev,
-      [action.agentId]: {
-        eventType: action.type,
-        message: action.message,
-        progress: action.progress,
-        targetDeskSlot: action.targetDeskSlot,
-        videoNumber: action.videoNumber,
-        totalVideos: action.totalVideos,
-      },
+      [action.agentId]: actionVisualState,
     }));
+    setVisualCommandLog((prev) => [
+      ...prev.slice(-199),
+      {
+        commandId: `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        agentId: action.agentId,
+        ...actionVisualState,
+      },
+    ]);
 
     const now = new Date().toLocaleTimeString('pt-BR', {
       hour: '2-digit',
@@ -972,6 +1004,7 @@ export function OfficeInteractiveStage({
       emptyBoxes[ag.id] = [];
     }
     setActiveStates(resetStates);
+    setVisualCommandLog([]);
     setInboxByAgent(emptyBoxes);
     setOutboxByAgent(emptyBoxes);
     setFeed([]);
@@ -1057,6 +1090,7 @@ export function OfficeInteractiveStage({
       emptyBoxes[ag.id] = [];
     }
     setActiveStates(initialStates);
+    setVisualCommandLog([]);
     setInboxByAgent(emptyBoxes);
     setOutboxByAgent(emptyBoxes);
 
@@ -1103,6 +1137,7 @@ export function OfficeInteractiveStage({
     if (replayHistory.length === 0) return;
     setIsPlaying(false);
     setIsLiveDatabaseRunActive(false);
+    setVisualCommandLog([]);
     setReplayCursor(-1);
     setIsReplayingHistory(true);
   }
@@ -1118,13 +1153,22 @@ export function OfficeInteractiveStage({
     if (action === 'restore') {
       setPausedBudgetAgentIds((prev) => ({ ...prev, [agentId]: false }));
       setSyntheticCalls((prev) => prev.filter((c) => c.agent_id !== agentId));
+      const restoredState: ActiveAgentVisualState = {
+        eventType: 'agent.idle',
+        message: `Orçamento de ${ag.name} restaurado! Pronto para novas tarefas.`,
+      };
       setActiveStates((prev) => ({
         ...prev,
-        [agentId]: {
-          eventType: 'agent.idle',
-          message: `Orçamento de ${ag.name} restaurado! Pronto para novas tarefas.`,
-        },
+        [agentId]: restoredState,
       }));
+      setVisualCommandLog((prev) => [
+        ...prev.slice(-199),
+        {
+          commandId: `budget_restore_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          agentId,
+          ...restoredState,
+        },
+      ]);
       return;
     }
 
@@ -1152,13 +1196,22 @@ export function OfficeInteractiveStage({
 
     if (action === 'hit_100') {
       setPausedBudgetAgentIds((prev) => ({ ...prev, [agentId]: true }));
+      const exceededState: ActiveAgentVisualState = {
+        eventType: 'budget.exceeded',
+        message: `100% do orçamento mensal atingido (${budget.toLocaleString()} tok)! ${ag.name} teve novas tasks bloqueadas e foi pausado na copa (💤).`,
+      };
       setActiveStates((prev) => ({
         ...prev,
-        [agentId]: {
-          eventType: 'budget.exceeded',
-          message: `100% do orçamento mensal atingido (${budget.toLocaleString()} tok)! ${ag.name} teve novas tasks bloqueadas e foi pausado na copa (💤).`,
-        },
+        [agentId]: exceededState,
       }));
+      setVisualCommandLog((prev) => [
+        ...prev.slice(-199),
+        {
+          commandId: `budget_100_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          agentId,
+          ...exceededState,
+        },
+      ]);
       setFeed((prev) => [
         {
           id: `budget_${Date.now()}`,
@@ -1880,6 +1933,7 @@ export function OfficeInteractiveStage({
           <OfficeGameCanvas
             agents={agents}
             activeStates={activeStates}
+            visualCommandLog={visualCommandLog}
             selectedAgentId={selectedAgentId}
             onSelectAgent={(id) => setSelectedAgentId(id)}
             onClickDesk={(slot) => setDeskModalSlot(slot)}

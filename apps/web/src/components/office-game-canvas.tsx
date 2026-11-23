@@ -19,9 +19,15 @@ export interface ActiveAgentVisualState {
   totalVideos?: number;
 }
 
+export interface CanvasVisualCommand extends ActiveAgentVisualState {
+  commandId: string;
+  agentId: string;
+}
+
 interface OfficeGameCanvasProps {
   agents: readonly VisualOfficeAgent[];
   activeStates: Record<string, ActiveAgentVisualState>;
+  visualCommandLog?: readonly CanvasVisualCommand[];
   selectedAgentId: string | null;
   onSelectAgent: (agentId: string) => void;
   onClickDesk?: (deskSlot: DeskSlot) => void;
@@ -45,6 +51,7 @@ interface Point2D {
 }
 
 interface QueuedVisualTransition {
+  eventType: AgentEventType;
   targetCol: number;
   targetRow: number;
   arrivalAnim: AnimClipName;
@@ -53,6 +60,16 @@ interface QueuedVisualTransition {
   bubbleBorderColor: string;
   progress?: number;
   eventKey: string;
+  /** Chave de entrega fisica que esta transicao libera ao chegar na estante destino (ex: "desk_2::v1") */
+  deliversToKey?: string;
+  /** Estante destino onde o pacote visual sera depositado ao chegar */
+  deliversToShelfSlot?: DeskSlot;
+  /** Chave de entrega fisica que deve estar concluida antes deste agente iniciar a transicao */
+  requiresDeliveryKey?: string;
+  /** Baia do agente anterior responsavel por entregar esse item na estante */
+  upstreamDeskSlot?: DeskSlot;
+  /** Se verdadeiro, ao chegar na propria estante retira 1 pasta visual da estante */
+  picksUpFromShelfSlot?: DeskSlot;
 }
 
 interface RuntimeAgentActor {
@@ -74,6 +91,7 @@ interface RuntimeAgentActor {
   sheetKey: 'char_1' | 'char_2' | 'char_3';
   holdUntilMs: number;
   lastAppliedEventKey: string;
+  activeTransition: QueuedVisualTransition | null;
   queue: QueuedVisualTransition[];
 }
 
@@ -216,6 +234,7 @@ function getFramesForClip(
 export default function OfficeGameCanvas({
   agents,
   activeStates,
+  visualCommandLog,
   selectedAgentId,
   onSelectAgent,
   onClickDesk,
@@ -224,6 +243,13 @@ export default function OfficeGameCanvas({
 }: OfficeGameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const actorsRef = useRef<Map<string, RuntimeAgentActor>>(new Map());
+  const deliveredShelfKeysRef = useRef<Set<string>>(new Set());
+  const shelfFolderCountRef = useRef<Record<DeskSlot, number>>({
+    desk_1: 0,
+    desk_2: 0,
+    desk_3: 0,
+  });
+  const processedCommandIdsRef = useRef<Set<string>>(new Set());
   const imagesRef = useRef<{
     office: HTMLImageElement | null;
     char_1: HTMLImageElement | null;
@@ -331,8 +357,7 @@ export default function OfficeGameCanvas({
             ? 'char_3'
             : 'char_2';
 
-      const coffeeClip: AnimClipName =
-        idx % 2 === 0 ? 'drink_coffee_stand' : 'drink_coffee_sit';
+      const coffeeClip: AnimClipName = 'drink_coffee_stand';
 
       map.set(ag.id, {
         agent: ag,
@@ -352,91 +377,169 @@ export default function OfficeGameCanvas({
         sheetKey,
         holdUntilMs: 0,
         lastAppliedEventKey: 'agent.idle::init',
+        activeTransition: null,
         queue: [],
       });
     });
 
     actorsRef.current = map;
+    deliveredShelfKeysRef.current.clear();
+    shelfFolderCountRef.current = { desk_1: 0, desk_2: 0, desk_3: 0 };
+    processedCommandIdsRef.current.clear();
   }, [agents]);
 
-  useEffect(() => {
+  function enqueueActorVisualState(
+    actor: RuntimeAgentActor,
+    st: ActiveAgentVisualState,
+    explicitEventKey?: string,
+  ) {
     const layout = DEFAULT_OFFICE_MAP_LAYOUT;
+    const eventKey =
+      explicitEventKey ??
+      `${st.eventType}::${st.message}::${st.progress ?? ''}::${st.videoNumber ?? ''}`;
 
+    if (
+      actor.lastAppliedEventKey === eventKey ||
+      actor.queue.some((q) => q.eventKey === eventKey)
+    ) {
+      return;
+    }
+
+    const mapping = EVENT_VISUAL_CATALOG[st.eventType];
+    const target = resolveEventTargetGrid(
+      st.eventType,
+      actor.agent.deskSlot,
+      actor.slotIndex,
+      layout,
+      st.targetDeskSlot,
+    );
+
+    const shortAction =
+      st.eventType === 'handoff.sent'
+        ? 'entregar estante'
+        : st.eventType === 'handoff.received'
+          ? 'pegar estante'
+          : (st.eventType.split('.')[1] ?? st.eventType);
+    const videoBadge =
+      typeof st.videoNumber === 'number' && typeof st.totalVideos === 'number'
+        ? ` #${st.videoNumber}/${st.totalVideos}`
+        : '';
+    const bubbleText = `${mapping.bubbleIcon} ${shortAction}${videoBadge}`;
+    const bubbleBorderColor =
+      st.eventType === 'task.failed'
+        ? '#ef4444'
+        : st.eventType === 'task.completed'
+          ? '#10b981'
+          : '#f59e0b';
+
+    let arrivalAnim: AnimClipName = 'paused';
+    let arrivalFlipX = false;
+
+    if (mapping.animationKey === 'sit_type') {
+      arrivalAnim = 'sit_type';
+      arrivalFlipX = actor.sheetKey !== 'char_3';
+    } else if (mapping.animationKey === 'stand_read') {
+      arrivalAnim = 'stand_read';
+      arrivalFlipX = false;
+    } else if (mapping.animationKey === 'drink_coffee') {
+      arrivalAnim = 'drink_coffee_stand';
+      arrivalFlipX = false;
+    } else if (mapping.animationKey === 'carry_folder') {
+      arrivalAnim = 'stand_read';
+      arrivalFlipX = false;
+    }
+
+    // Interrupcao imediata ou reset limpa a fila de animacao do agente
+    if (st.eventType === 'agent.idle' && st.message.toLowerCase().includes('interromp')) {
+      actor.queue = [];
+      actor.path = [];
+      actor.activeTransition = null;
+      actor.holdUntilMs = 0;
+    }
+
+    // Mapeia dependencia fisica de entrega nas estantes:
+    // - desk_1 (Roteirista) -> entrega em desk_2 (Editor)
+    // - desk_2 (Editor) -> entrega em desk_3 (Publicador)
+    const videoNum = typeof st.videoNumber === 'number' ? st.videoNumber : 1;
+    let deliversToKey: string | undefined;
+    let deliversToShelfSlot: DeskSlot | undefined;
+    let requiresDeliveryKey: string | undefined;
+    let upstreamDeskSlot: DeskSlot | undefined;
+    let picksUpFromShelfSlot: DeskSlot | undefined;
+
+    if (st.eventType === 'handoff.sent') {
+      const destSlot: DeskSlot =
+        st.targetDeskSlot ?? (actor.agent.deskSlot === 'desk_1' ? 'desk_2' : 'desk_3');
+      deliversToShelfSlot = destSlot;
+      deliversToKey = `${destSlot}::v${videoNum}`;
+    }
+
+    const isDownstreamWorkEvent =
+      (actor.agent.deskSlot === 'desk_2' || actor.agent.deskSlot === 'desk_3') &&
+      st.eventType !== 'agent.idle' &&
+      st.eventType !== 'budget.exceeded';
+
+    if (isDownstreamWorkEvent) {
+      upstreamDeskSlot = actor.agent.deskSlot === 'desk_2' ? 'desk_1' : 'desk_2';
+      requiresDeliveryKey = `${actor.agent.deskSlot}::v${videoNum}`;
+    }
+
+    if (st.eventType === 'handoff.received') {
+      picksUpFromShelfSlot = actor.agent.deskSlot;
+    }
+
+    actor.queue.push({
+      eventType: st.eventType,
+      targetCol: target.col,
+      targetRow: target.row,
+      arrivalAnim,
+      arrivalFlipX,
+      bubbleText,
+      bubbleBorderColor,
+      progress: st.progress,
+      eventKey,
+      deliversToKey,
+      deliversToShelfSlot,
+      requiresDeliveryKey,
+      upstreamDeskSlot,
+      picksUpFromShelfSlot,
+    });
+  }
+
+  // Consome log ordenado de comandos visuais (evita perda de passos intermediarios como handoff.sent)
+  useEffect(() => {
+    if (!visualCommandLog) return;
+    if (visualCommandLog.length === 0) {
+      deliveredShelfKeysRef.current.clear();
+      shelfFolderCountRef.current = { desk_1: 0, desk_2: 0, desk_3: 0 };
+      processedCommandIdsRef.current.clear();
+      actorsRef.current.forEach((actor) => {
+        actor.queue = [];
+        actor.activeTransition = null;
+        actor.holdUntilMs = 0;
+      });
+      return;
+    }
+
+    for (const cmd of visualCommandLog) {
+      if (processedCommandIdsRef.current.has(cmd.commandId)) continue;
+      processedCommandIdsRef.current.add(cmd.commandId);
+      const actor = actorsRef.current.get(cmd.agentId);
+      if (!actor) continue;
+      enqueueActorVisualState(actor, cmd, cmd.commandId);
+    }
+  }, [visualCommandLog]);
+
+  useEffect(() => {
+    if (visualCommandLog && visualCommandLog.length > 0) {
+      return;
+    }
     Object.entries(activeStates).forEach(([agentId, st]) => {
       const actor = actorsRef.current.get(agentId);
       if (!actor) return;
-
-      const eventKey = `${st.eventType}::${st.message}::${st.progress ?? ''}`;
-      if (
-        actor.lastAppliedEventKey === eventKey ||
-        actor.queue.some((q) => q.eventKey === eventKey)
-      ) {
-        return;
-      }
-
-      const mapping = EVENT_VISUAL_CATALOG[st.eventType];
-      const target = resolveEventTargetGrid(
-        st.eventType,
-        actor.agent.deskSlot,
-        actor.slotIndex,
-        layout,
-        st.targetDeskSlot,
-      );
-
-      const shortAction =
-        st.eventType === 'handoff.sent'
-          ? 'entregar estante'
-          : st.eventType === 'handoff.received'
-            ? 'pegar estante'
-            : (st.eventType.split('.')[1] ?? st.eventType);
-      const videoBadge =
-        typeof st.videoNumber === 'number' && typeof st.totalVideos === 'number'
-          ? ` #${st.videoNumber}/${st.totalVideos}`
-          : '';
-      const bubbleText = `${mapping.bubbleIcon} ${shortAction}${videoBadge}`;
-      const bubbleBorderColor =
-        st.eventType === 'task.failed'
-          ? '#ef4444'
-          : st.eventType === 'task.completed'
-            ? '#10b981'
-            : '#f59e0b';
-
-      let arrivalAnim: AnimClipName = 'paused';
-      let arrivalFlipX = false;
-
-      if (mapping.animationKey === 'sit_type') {
-        arrivalAnim = 'sit_type';
-        arrivalFlipX = actor.sheetKey !== 'char_3';
-      } else if (mapping.animationKey === 'stand_read') {
-        arrivalAnim = 'stand_read';
-        arrivalFlipX = false;
-      } else if (mapping.animationKey === 'drink_coffee') {
-        arrivalAnim =
-          actor.slotIndex % 2 === 0 ? 'drink_coffee_stand' : 'drink_coffee_sit';
-        arrivalFlipX = false;
-      } else if (mapping.animationKey === 'carry_folder') {
-        arrivalAnim = 'walk_down';
-        arrivalFlipX = false;
-      }
-
-      if (st.eventType === 'agent.idle' && st.message.toLowerCase().includes('interromp')) {
-        actor.queue = [];
-        actor.path = [];
-        actor.holdUntilMs = 0;
-      }
-
-      actor.queue.push({
-        targetCol: target.col,
-        targetRow: target.row,
-        arrivalAnim,
-        arrivalFlipX,
-        bubbleText,
-        bubbleBorderColor,
-        progress: st.progress,
-        eventKey,
-      });
+      enqueueActorVisualState(actor, st);
     });
-  }, [activeStates]);
+  }, [activeStates, visualCommandLog]);
 
   useEffect(() => {
     let rafId = 0;
@@ -479,18 +582,23 @@ export default function OfficeGameCanvas({
           const deskY = spot.chair.row * layout.tileHeight - 24;
           const bayNum = slot.replace('desk_', '');
 
-          // Badge clicavel da Estante (Caixa de Entrada/Saida)
+          // Badge clicavel da Estante (Caixa de Entrada/Saida) + indicador de pastas fisicas aguardando retirada
+          const pendingFolders = shelfFolderCountRef.current[slot] ?? 0;
           ctx.save();
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.86)';
-          ctx.fillRect(shelfX - 38, shelfY - 9, 76, 17);
-          ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
-          ctx.lineWidth = 1.2;
-          ctx.strokeRect(shelfX - 38, shelfY - 9, 76, 17);
+          ctx.fillStyle = pendingFolders > 0 ? 'rgba(120, 53, 15, 0.94)' : 'rgba(15, 23, 42, 0.86)';
+          ctx.fillRect(shelfX - 42, shelfY - 9, 84, 17);
+          ctx.strokeStyle = pendingFolders > 0 ? '#fbbf24' : 'rgba(245, 158, 11, 0.85)';
+          ctx.lineWidth = pendingFolders > 0 ? 1.8 : 1.2;
+          ctx.strokeRect(shelfX - 42, shelfY - 9, 84, 17);
           ctx.fillStyle = '#fde68a';
           ctx.font = 'bold 9px monospace';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-          ctx.fillText(`📚 Estante B${bayNum}`, shelfX, shelfY);
+          ctx.fillText(
+            pendingFolders > 0 ? `📄 Estante B${bayNum} (${pendingFolders})` : `📚 Estante B${bayNum}`,
+            shelfX,
+            shelfY,
+          );
           ctx.restore();
 
           // Badge clicavel da Mesa / Computador CRT (Ferramentas & Contexto)
@@ -511,9 +619,58 @@ export default function OfficeGameCanvas({
         const moveSpeedPxPerSec = 128 * speedRef.current;
         const sortedActors = Array.from(actorsRef.current.values());
 
+        const completeArrivalSideEffects = (actor: RuntimeAgentActor) => {
+          const done = actor.activeTransition;
+          if (!done) return;
+          if (done.deliversToKey) {
+            deliveredShelfKeysRef.current.add(done.deliversToKey);
+            if (done.deliversToShelfSlot) {
+              shelfFolderCountRef.current[done.deliversToShelfSlot] =
+                (shelfFolderCountRef.current[done.deliversToShelfSlot] ?? 0) + 1;
+            }
+          }
+          if (done.picksUpFromShelfSlot) {
+            shelfFolderCountRef.current[done.picksUpFromShelfSlot] = Math.max(
+              0,
+              (shelfFolderCountRef.current[done.picksUpFromShelfSlot] ?? 0) - 1,
+            );
+          }
+          actor.activeTransition = null;
+        };
+
         for (const actor of sortedActors) {
+          // Conclui efeitos fisicos de entrega/retirada na estante assim que o agente termina o gesto na estante
+          if (actor.path.length === 0 && now >= actor.holdUntilMs && actor.activeTransition) {
+            completeArrivalSideEffects(actor);
+          }
+
           if (actor.path.length === 0 && now >= actor.holdUntilMs && actor.queue.length > 0) {
+            const peek = actor.queue[0]!;
+
+            // BARREIRA DE IMERSAO: Mesmo que o backend/IA ja tenha processado a proxima etapa,
+            // o funcionario destinatario AGUARDA o agente anterior chegar fisicamente a estante e entregar a pasta!
+            if (
+              peek.requiresDeliveryKey &&
+              !deliveredShelfKeysRef.current.has(peek.requiresDeliveryKey) &&
+              peek.upstreamDeskSlot
+            ) {
+              const upstreamActor = sortedActors.find(
+                (a) => a.agent.deskSlot === peek.upstreamDeskSlot,
+              );
+              const upstreamHasPendingDelivery =
+                upstreamActor &&
+                (upstreamActor.path.length > 0 ||
+                  upstreamActor.queue.length > 0 ||
+                  upstreamActor.activeTransition?.deliversToKey === peek.requiresDeliveryKey ||
+                  now < upstreamActor.holdUntilMs);
+
+              if (upstreamHasPendingDelivery) {
+                continue;
+              }
+            }
+
             const nextTransition = actor.queue.shift()!;
+            actor.activeTransition = nextTransition;
             actor.lastAppliedEventKey = nextTransition.eventKey;
             actor.arrivalAnim = nextTransition.arrivalAnim;
             actor.arrivalFlipX = nextTransition.arrivalFlipX;
@@ -534,7 +691,7 @@ export default function OfficeGameCanvas({
               actor.path = [];
               actor.anim = actor.arrivalAnim;
               actor.flipX = actor.arrivalFlipX;
-              actor.holdUntilMs = now + Math.round(950 / speedRef.current);
+              actor.holdUntilMs = now + Math.round(750 / speedRef.current);
             } else {
               actor.path = findAStarPath(
                 layout.grid,
@@ -580,7 +737,9 @@ export default function OfficeGameCanvas({
               if (actor.path.length === 0) {
                 actor.anim = actor.arrivalAnim;
                 actor.flipX = actor.arrivalFlipX;
-                actor.holdUntilMs = now + Math.round(1150 / speedRef.current);
+                const holdDuration =
+                  actor.activeTransition?.eventType === 'handoff.sent' ? 750 : 1050;
+                actor.holdUntilMs = now + Math.round(holdDuration / speedRef.current);
               }
             } else {
               actor.x += (dx / dist) * step;

@@ -251,12 +251,22 @@ export async function processQueuedAgentTask(
     const youtubeOAuth = (await repo.getOfficeYoutubeOAuth?.(agent.office_id)) ?? null;
     const storageClient = repo.getStorageClient?.() ?? null;
 
-    const upstreamClips = (
-      task.input as {
-        clips?: { source_url?: string; start_sec?: number; end_sec?: number }[];
-      }
-    ).clips;
-    const firstClip = upstreamClips?.[0];
+    const upstreamInput = task.input as {
+      clips?: {
+        source_url?: string;
+        start_sec?: number;
+        end_sec?: number;
+        suggested_title?: string;
+        hook?: string;
+        rationale?: string;
+      }[];
+      edited_shorts?: {
+        suggested_title?: string;
+        storage_path?: string;
+      }[];
+    };
+    const firstClip = upstreamInput.clips?.[0];
+    const firstEdited = upstreamInput.edited_shorts?.[0];
 
     const toolContext: ToolExecutionContext = {
       officeId: agent.office_id,
@@ -271,6 +281,9 @@ export async function processQueuedAgentTask(
       sourceUrl: firstClip?.source_url,
       startSec: firstClip?.start_sec,
       endSec: firstClip?.end_sec,
+      suggestedTitle: firstEdited?.suggested_title ?? firstClip?.suggested_title,
+      hookText: firstClip?.hook,
+      transcriptText: firstClip?.rationale,
       youtubeOAuth,
       supabaseStorageClient: storageClient,
       abortSignal: options?.abortSignal,
