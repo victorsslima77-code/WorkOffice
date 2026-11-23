@@ -333,4 +333,16 @@ describe('@workoffice/worker — Etapa 5 (Worker Core, Multi-Provedor, Tool Regi
     expect(env.agents['ag-scriptwriter']!.status).toBe('paused_budget');
     expect(env.events.some((e) => e.type === 'budget.exceeded')).toBe(true);
   });
+
+  it('nao silencia erro HTTP 404/401 em chave real nem gera fallback mockup source_01', async () => {
+    const env = createInMemoryWorkerRepository();
+    env.agents['ag-scriptwriter']!.provider = 'google';
+    env.agents['ag-scriptwriter']!.model = 'gemini-2.5-pro';
+    env.repo.getDecryptedSecretForAgent = async () => 'AIzaSyFakeInvalidKeyForNonSandboxTest123456';
+
+    const outcome = await processQueuedAgentTask('task-1', env.repo);
+    expect(outcome.status).toBe('failed');
+    expect(env.artifacts).toHaveLength(0);
+    expect(env.events.some((e) => e.type === 'task.failed')).toBe(true);
+  }, 15_000);
 });

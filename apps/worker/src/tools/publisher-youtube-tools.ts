@@ -31,6 +31,7 @@ export interface YoutubeUploadShortParams {
   mp4Buffer?: Buffer;
   oauth?: YoutubeOAuthCredentials | null;
   supabaseStorageClient?: SupabaseClient | null;
+  allowSandboxFallback?: boolean;
 }
 
 export interface YoutubeUploadedShortResult {
@@ -301,6 +302,12 @@ export async function uploadShortToYoutubeChannel(
         }
       }
     }
+  }
+
+  if (params.allowSandboxFallback === false) {
+    throw new Error(
+      'Publicador bloqueou upload simulado: conecte credenciais OAuth reais do YouTube (Client ID, Client Secret e Refresh Token) no Cofre do Escritório.',
+    );
   }
 
   return {

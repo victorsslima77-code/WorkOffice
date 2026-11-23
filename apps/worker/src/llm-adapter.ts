@@ -24,6 +24,7 @@ export interface LlmAdapterRequest {
 
 export interface LlmAdapterResult {
   rawOutput: unknown;
+  resolvedModel: string;
   inputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
@@ -123,6 +124,155 @@ function tryParseJsonFromLlmText(text: string): ParsedScriptwriterLlmJson | null
   }
 }
 
+function extractErrorStatusAndMessage(err: unknown): { status?: number; message: string } {
+  const e = err as {
+    statusCode?: number;
+    status?: number;
+    responseBody?: string;
+    message?: string;
+    cause?: { statusCode?: number; status?: number; message?: string };
+  };
+  const status = e?.statusCode ?? e?.status ?? e?.cause?.statusCode ?? e?.cause?.status;
+  const rawMsg = e?.responseBody
+    ? `${e.message ?? 'Erro LLM'} | ${String(e.responseBody).slice(0, 320)}`
+    : (e?.message ?? String(err));
+  return { status, message: rawMsg };
+}
+
+function isNotFound404Error(err: unknown): boolean {
+  const { status, message } = extractErrorStatusAndMessage(err);
+  return (
+    status === 404 ||
+    /\b404\b|not_found|is not found for api version|models\/.+ not found/i.test(message)
+  );
+}
+
+/**
+ * Consulta GET /v1beta/models na Google AI Studio usando a propria chave do agente
+ * e escolhe automaticamente o melhor modelo Gemini ativo que suporta generateContent.
+ * Evita erros 404 quando um modelo antigo (ex: gemini-2.5-pro / gemini-2.5-flash) foi
+ * descontinuado ou nao esta disponivel no tier gratuito daquela chave.
+ */
+export async function discoverActiveGoogleGeminiModel(
+  apiKey: string,
+  requestedModel: string,
+): Promise<{ selectedModel: string | null; availableModels: string[] }> {
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+      method: 'GET',
+      headers: {
+        'x-goog-api-key': apiKey.trim(),
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) {
+      return { selectedModel: null, availableModels: [] };
+    }
+
+    const data = (await res.json()) as {
+      models?: {
+        name?: string;
+        supportedGenerationMethods?: string[];
+      }[];
+    };
+
+    const excludedPattern =
+      /embedding|imagen|veo|tts|audio|live|aqa|bison|gecko|robotics|computer-use|learnlm|gemma|banana/i;
+
+    const availableModels = (data.models ?? [])
+      .filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
+      .map((m) => String(m.name ?? '').replace(/^models\//, '').trim())
+      .filter((id) => id.startsWith('gemini-') && !excludedPattern.test(id));
+
+    if (availableModels.length === 0) {
+      return { selectedModel: null, availableModels: [] };
+    }
+
+    const wantsPro = requestedModel.toLowerCase().includes('pro');
+
+    const scoreModel = (id: string): number => {
+      const lower = id.toLowerCase();
+      let score = 0;
+      if (lower === requestedModel.toLowerCase()) score -= 1000; // Ja falhou com 404!
+      if (wantsPro && lower.includes('pro')) score += 40;
+      if (!wantsPro && lower.includes('flash')) score += 40;
+      if (lower.includes('flash')) score += 20;
+      if (lower.includes('latest')) score += 15;
+      if (lower.includes('exp') || lower.includes('preview')) score -= 5;
+      const verMatch = lower.match(/gemini-(\d+(?:\.\d+)?)/);
+      if (verMatch?.[1]) {
+        score += Number(verMatch[1]) * 10;
+      }
+      return score;
+    };
+
+    const ranked = [...availableModels].sort((a, b) => scoreModel(b) - scoreModel(a));
+    const best = ranked.find((id) => id !== requestedModel) ?? ranked[0] ?? null;
+    return { selectedModel: best, availableModels };
+  } catch {
+    return { selectedModel: null, availableModels: [] };
+  }
+}
+
+/**
+ * Fallback explicito para chaves Google Cloud Vertex AI Express Mode (prefixo AQ.)
+ * caso o endpoint generativelanguage.googleapis.com retorne 404.
+ */
+async function callVertexExpressGenerateContent(params: {
+  apiKey: string;
+  modelId: string;
+  systemPrompt: string;
+  prompt: string;
+  maxOutputTokens: number;
+  abortSignal?: AbortSignal;
+}): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+  const url = `https://aiplatform.googleapis.com/v1/publishers/google/models/${encodeURIComponent(params.modelId)}:generateContent`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': params.apiKey.trim(),
+    },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: params.systemPrompt }],
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: params.prompt }],
+        },
+      ],
+      generationConfig: {
+        maxOutputTokens: params.maxOutputTokens,
+      },
+    }),
+    signal: params.abortSignal ?? AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Vertex Express HTTP ${res.status} (${params.modelId}): ${body.slice(0, 260)}`);
+  }
+
+  const json = (await res.json()) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+  };
+
+  const text = (json.candidates?.[0]?.content?.parts ?? [])
+    .map((p) => p.text ?? '')
+    .join('')
+    .trim();
+
+  return {
+    text,
+    inputTokens: json.usageMetadata?.promptTokenCount ?? 0,
+    outputTokens: json.usageMetadata?.candidatesTokenCount ?? 0,
+  };
+}
+
 /**
  * Executa o pipeline de ferramentas e geracao estruturada para o cargo usando o Vercel AI SDK
  * (ou o modo deterministico Sandbox quando a credencial salva no Vault for `wo_test_...`).
@@ -160,6 +310,7 @@ export async function runRoleWithMultiProviderLlm(
   }
 
   const isSandboxKey = req.apiKey.startsWith('wo_test_');
+  let resolvedModel = req.model;
   let inputTokens = Math.round(1100 * effortCfg.estimatedTokenMultiplier);
   let outputTokens = Math.round(650 * effortCfg.estimatedTokenMultiplier);
   const reasoningTokens =
@@ -169,85 +320,150 @@ export async function runRoleWithMultiProviderLlm(
   let generatedTitleFallback: string | null = null;
 
   if (!isSandboxKey) {
-    try {
+    // Garante que maxTokens seja sempre MAIOR que thinkingBudgetTokens (exigido por Gemini 2.5 e Claude Thinking!)
+    const effectiveMaxTokens = Math.max(
+      effortCfg.maxOutputTokens,
+      effortCfg.thinkingBudgetTokens + 2048,
+    );
+
+    let rolePrompt: string;
+    if (req.roleSlug === 'scriptwriter') {
+      const candidatesList = (ctx.candidateVideos ?? [])
+        .slice(0, 5)
+        .map(
+          (v, i) =>
+            `${i + 1}. URL: ${v.url} | Título Original: "${v.title}" | Canal: ${v.channelTitle} | Duração: ${v.durationSec}s${v.description ? ` | Resumo: ${v.description.slice(0, 140)}` : ''}`,
+        )
+        .join('\n');
+
+      rolePrompt = [
+        `Pedido do usuário: "${ctx.instruction}" (produzindo Vídeo #${vNum} de ${ctx.totalVideos}).`,
+        candidatesList
+          ? `Vídeos REAIS encontrados no YouTube:\n${candidatesList}`
+          : `URL de origem candidata: ${ctx.sourceUrl ?? 'não encontrada'}`,
+        ctx.transcriptText
+          ? `Contexto/descrição extraída do vídeo selecionado:\n${ctx.transcriptText.slice(0, 600)}`
+          : '',
+        `Retorne APENAS um JSON válido (sem markdown, sem comentários) com as chaves exatas:`,
+        `{`,
+        `  "source_url": "<escolha uma URL REAL da lista acima>",`,
+        `  "start_sec": <numero inteiro em segundos, dentro da duracao do video>,`,
+        `  "end_sec": <numero inteiro em segundos, sendo end_sec - start_sec entre 25 e 58 segundos>,`,
+        `  "suggested_title": "<título viral, chamativo e natural em português para YouTube Shorts com até 85 caracteres terminando com #shorts — NUNCA repita o comando do usuário>",`,
+        `  "hook": "<frase curta de impacto para os 3 primeiros segundos do Short que prende a atenção>",`,
+        `  "rationale": "<instruções claras e detalhadas para o Editor: por que esse trecho retém audiência, ritmo de cortes, zoom e quais palavras destacar na legenda>",`,
+        `  "score": <nota de retenção de 75 a 99>`,
+        `}`,
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+    } else {
+      rolePrompt = `Crie um título viral curto (máx 80 caracteres, terminando com #shorts) em português para o Vídeo #${vNum}/${ctx.totalVideos} baseado no tema "${ctx.suggestedTitle ?? ctx.instruction}". Retorne apenas o título.`;
+    }
+
+    const invokeAiSdk = async (targetModel: string, includeProviderOpts: boolean) => {
       const providerModel =
         req.provider === 'anthropic'
-          ? createAnthropic({ apiKey: req.apiKey })(req.model)
+          ? createAnthropic({ apiKey: req.apiKey })(targetModel)
           : req.provider === 'google'
-            ? createGoogleGenerativeAI({ apiKey: req.apiKey })(req.model)
-            : createOpenAI({ apiKey: req.apiKey })(req.model);
+            ? createGoogleGenerativeAI({ apiKey: req.apiKey })(targetModel)
+            : createOpenAI({ apiKey: req.apiKey })(targetModel);
 
-      // Garante que maxTokens seja sempre MAIOR que thinkingBudgetTokens (exigido por Gemini 2.5 e Claude Thinking!)
-      const effectiveMaxTokens = Math.max(
-        effortCfg.maxOutputTokens,
-        effortCfg.thinkingBudgetTokens + 2048,
-      );
-
-      let rolePrompt: string;
-      if (req.roleSlug === 'scriptwriter') {
-        const candidatesList = (ctx.candidateVideos ?? [])
-          .slice(0, 5)
-          .map(
-            (v, i) =>
-              `${i + 1}. URL: ${v.url} | Título Original: "${v.title}" | Canal: ${v.channelTitle} | Duração: ${v.durationSec}s${v.description ? ` | Resumo: ${v.description.slice(0, 140)}` : ''}`,
-          )
-          .join('\n');
-
-        rolePrompt = [
-          `Pedido do usuário: "${ctx.instruction}" (produzindo Vídeo #${vNum} de ${ctx.totalVideos}).`,
-          candidatesList
-            ? `Vídeos REAIS encontrados no YouTube:\n${candidatesList}`
-            : `URL de origem candidata: ${ctx.sourceUrl ?? 'não encontrada'}`,
-          ctx.transcriptText
-            ? `Contexto/descrição extraída do vídeo selecionado:\n${ctx.transcriptText.slice(0, 600)}`
-            : '',
-          `Retorne APENAS um JSON válido (sem markdown, sem comentários) com as chaves exatas:`,
-          `{`,
-          `  "source_url": "<escolha uma URL REAL da lista acima>",`,
-          `  "start_sec": <numero inteiro em segundos, dentro da duracao do video>,`,
-          `  "end_sec": <numero inteiro em segundos, sendo end_sec - start_sec entre 25 e 58 segundos>,`,
-          `  "suggested_title": "<título viral, chamativo e natural em português para YouTube Shorts com até 85 caracteres terminando com #shorts — NUNCA repita o comando do usuário>",`,
-          `  "hook": "<frase curta de impacto para os 3 primeiros segundos do Short que prende a atenção>",`,
-          `  "rationale": "<instruções claras e detalhadas para o Editor: por que esse trecho retém audiência, ritmo de cortes, zoom e quais palavras destacar na legenda>",`,
-          `  "score": <nota de retenção de 75 a 99>`,
-          `}`,
-        ]
-          .filter(Boolean)
-          .join('\n\n');
-      } else {
-        rolePrompt = `Crie um título viral curto (máx 80 caracteres, terminando com #shorts) em português para o Vídeo #${vNum}/${ctx.totalVideos} baseado no tema "${ctx.suggestedTitle ?? ctx.instruction}". Retorne apenas o título.`;
-      }
-
-      const llmRes = await generateText({
+      return generateText({
         model: providerModel,
         system: req.systemPrompt,
         prompt: rolePrompt,
         maxTokens: effectiveMaxTokens,
-        providerOptions: buildProviderSpecificOptions(req.provider, req.model, req.effort) as never,
+        providerOptions: includeProviderOpts
+          ? (buildProviderSpecificOptions(req.provider, targetModel, req.effort) as never)
+          : undefined,
         abortSignal: ctx.abortSignal,
       });
+    };
 
-      const rawText = llmRes.text.trim();
-      if (rawText) {
-        if (req.roleSlug === 'scriptwriter') {
-          parsedScriptJson = tryParseJsonFromLlmText(rawText);
-        } else {
-          generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
-        }
-      }
-
+    let rawText = '';
+    try {
+      const llmRes = await invokeAiSdk(resolvedModel, true);
+      rawText = llmRes.text.trim();
       if (llmRes.usage) {
         inputTokens = llmRes.usage.promptTokens || inputTokens;
         outputTokens = llmRes.usage.completionTokens || outputTokens;
       }
-    } catch (err) {
-      console.error(
-        `[WorkOffice LLM] Falha ao chamar ${req.provider}/${req.model}:`,
-        (err as Error).message,
-      );
+    } catch (firstErr) {
       if (ctx.abortSignal?.aborted) {
-        throw new Error('Chamada LLM cancelada pelo usuario.');
+        throw new Error('Chamada LLM cancelada pelo usuário.');
       }
+
+      // Auto-recuperacao para Google Gemini 404 (modelo depreciado/indisponivel na chave ou chave AQ. Express Mode)
+      if (req.provider === 'google' && isNotFound404Error(firstErr)) {
+        const discovery = await discoverActiveGoogleGeminiModel(req.apiKey, resolvedModel);
+
+        if (discovery.selectedModel) {
+          resolvedModel = discovery.selectedModel;
+          await ctx.emitVisualEvent({
+            type: 'llm.thinking',
+            message: `Modelo ${req.model} retornou 404 na chave Google AI Studio; usando modelo ativo "${resolvedModel}".`,
+          });
+
+          try {
+            const retryRes = await invokeAiSdk(resolvedModel, false);
+            rawText = retryRes.text.trim();
+            if (retryRes.usage) {
+              inputTokens = retryRes.usage.promptTokens || inputTokens;
+              outputTokens = retryRes.usage.completionTokens || outputTokens;
+            }
+          } catch (retryErr) {
+            const detail = extractErrorStatusAndMessage(retryErr);
+            throw new Error(
+              `Google Gemini falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
+            );
+          }
+        } else if (req.apiKey.trim().startsWith('AQ.')) {
+          try {
+            const vertexRes = await callVertexExpressGenerateContent({
+              apiKey: req.apiKey,
+              modelId: resolvedModel,
+              systemPrompt: req.systemPrompt,
+              prompt: rolePrompt,
+              maxOutputTokens: effectiveMaxTokens,
+              abortSignal: ctx.abortSignal,
+            });
+            rawText = vertexRes.text;
+            if (vertexRes.inputTokens > 0) inputTokens = vertexRes.inputTokens;
+            if (vertexRes.outputTokens > 0) outputTokens = vertexRes.outputTokens;
+          } catch (vertexErr) {
+            const firstDetail = extractErrorStatusAndMessage(firstErr);
+            const vertexDetail = extractErrorStatusAndMessage(vertexErr);
+            throw new Error(
+              `Google AI Studio retornou HTTP 404 para "${req.model}" (${firstDetail.message}) e Vertex Express também falhou (${vertexDetail.message}). Verifique os modelos ativos na sua chave/projeto no Google AI Studio.`,
+            );
+          }
+        } else {
+          const detail = extractErrorStatusAndMessage(firstErr);
+          throw new Error(
+            `Google AI Studio retornou HTTP 404 para "${req.model}" e nenhum modelo alternativo com generateContent foi encontrado nessa chave (${detail.message}). Verifique se a chave/projeto tem acesso ativo aos modelos Gemini no Google AI Studio.`,
+          );
+        }
+      } else {
+        const detail = extractErrorStatusAndMessage(firstErr);
+        throw new Error(
+          `Falha na chamada ${req.provider.toUpperCase()} (${req.model}) [HTTP ${detail.status ?? 'erro'}]: ${detail.message}`,
+        );
+      }
+    }
+
+    if (rawText) {
+      if (req.roleSlug === 'scriptwriter') {
+        parsedScriptJson = tryParseJsonFromLlmText(rawText);
+      } else {
+        generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
+      }
+    }
+
+    if (req.roleSlug === 'scriptwriter' && !parsedScriptJson) {
+      throw new Error(
+        `LLM (${req.provider}/${resolvedModel}) respondeu sem JSON válido para o Roteirista: "${rawText.slice(0, 180)}"`,
+      );
     }
   }
 
@@ -262,7 +478,15 @@ export async function runRoleWithMultiProviderLlm(
         : undefined;
 
     const finalSourceUrl =
-      llmChosenUrl ?? ctx.sourceUrl ?? `https://www.youtube.com/watch?v=source_${vPad}`;
+      llmChosenUrl ??
+      ctx.sourceUrl ??
+      (isSandboxKey ? `https://www.youtube.com/watch?v=source_${vPad}` : undefined);
+
+    if (!finalSourceUrl) {
+      throw new Error(
+        `Roteirista não obteve nenhuma URL real do YouTube para "${ctx.instruction}" (fallback mockup bloqueado em produção).`,
+      );
+    }
 
     const rawStart =
       typeof parsedScriptJson?.start_sec === 'number' && parsedScriptJson.start_sec >= 0
@@ -372,10 +596,11 @@ export async function runRoleWithMultiProviderLlm(
   }
 
   const latencyMs = Math.max(15, Date.now() - startedAt);
-  const costUsd = calculateLlmCallCostUsd(req.model, inputTokens, outputTokens, reasoningTokens);
+  const costUsd = calculateLlmCallCostUsd(resolvedModel, inputTokens, outputTokens, reasoningTokens);
 
   return {
     rawOutput,
+    resolvedModel,
     inputTokens,
     outputTokens,
     reasoningTokens,

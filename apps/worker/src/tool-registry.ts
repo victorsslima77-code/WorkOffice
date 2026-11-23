@@ -47,6 +47,7 @@ export interface ToolExecutionContext {
   youtubeOAuth?: YoutubeOAuthCredentials | null;
   supabaseStorageClient?: SupabaseClient | null;
   lastUploadedShort?: YoutubeUploadedShortResult | null;
+  isSandbox?: boolean;
   abortSignal?: AbortSignal;
   emitVisualEvent: (params: {
     type: AgentEventType;
@@ -80,7 +81,9 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         progress: 25,
         message: `Pesquisando tendências para Vídeo #${ctx.videoIndex}/${ctx.totalVideos}: "${query}"`,
       });
-      return searchTrendingTopicsForScriptwriter(query, ctx.videoIndex, ctx.youtubeOAuth);
+      return searchTrendingTopicsForScriptwriter(query, ctx.videoIndex, ctx.youtubeOAuth, {
+        allowSandboxFallback: Boolean(ctx.isSandbox),
+      });
     },
   },
 
@@ -102,6 +105,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         ctx.instruction,
         ctx.videoIndex,
         ctx.youtubeOAuth,
+        { allowSandboxFallback: Boolean(ctx.isSandbox) },
       );
       ctx.candidateVideos = videos;
       if (videos[0]) {
@@ -120,11 +124,14 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     visualEventType: 'research.read_source',
     defaultProgress: 65,
     async execute(args, ctx) {
-      const sourceUrl = String(
-        args.source_url ??
-          ctx.sourceUrl ??
-          `https://www.youtube.com/watch?v=source_${String(ctx.videoIndex).padStart(2, '0')}`,
-      );
+      const candidateUrl = args.source_url ? String(args.source_url) : ctx.sourceUrl;
+      if (!candidateUrl && !ctx.isSandbox) {
+        throw new Error(
+          `Roteirista não encontrou nenhuma URL real do YouTube para extrair contexto (Vídeo #${ctx.videoIndex}).`,
+        );
+      }
+      const sourceUrl =
+        candidateUrl ?? `https://www.youtube.com/watch?v=source_${String(ctx.videoIndex).padStart(2, '0')}`;
       await ctx.emitVisualEvent({
         type: 'research.read_source',
         toolName: 'fetch_transcript',
@@ -174,9 +181,13 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     visualEventType: 'edit.download',
     defaultProgress: 25,
     async execute(args, ctx) {
-      const sourceUrl = String(
-        args.source_url ?? ctx.sourceUrl ?? 'https://www.youtube.com/watch?v=demo',
-      );
+      const candidateUrl = args.source_url ? String(args.source_url) : ctx.sourceUrl;
+      if (!candidateUrl && !ctx.isSandbox) {
+        throw new Error(
+          `Editor não recebeu nenhuma URL real de vídeo do Roteirista para o Vídeo #${ctx.videoIndex}.`,
+        );
+      }
+      const sourceUrl = candidateUrl ?? 'https://www.youtube.com/watch?v=demo';
       await ctx.emitVisualEvent({
         type: 'edit.download',
         toolName: 'download_video_segment',
@@ -252,6 +263,11 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     async execute(_args, ctx) {
       const startSec = ctx.startSec ?? 60;
       const endSec = ctx.endSec ?? 112;
+      if (!ctx.sourceUrl && !ctx.isSandbox) {
+        throw new Error(
+          `Editor não recebeu nenhuma URL real de vídeo para renderizar o Vídeo #${ctx.videoIndex}.`,
+        );
+      }
       const sourceUrl = ctx.sourceUrl ?? 'https://www.youtube.com/watch?v=demo';
 
       const pkg = await renderShortVideoPackage({
@@ -267,6 +283,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
           ctx.transcriptText ??
           `Corte vertical 9:16 com legendas sincronizadas para ${ctx.instruction}.`,
         supabaseStorageClient: ctx.supabaseStorageClient,
+        allowSyntheticFallback: Boolean(ctx.isSandbox),
       });
 
       await ctx.emitVisualEvent({
@@ -306,6 +323,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         visibility: 'private',
         oauth: ctx.youtubeOAuth,
         supabaseStorageClient: ctx.supabaseStorageClient,
+        allowSandboxFallback: Boolean(ctx.isSandbox),
       });
 
       ctx.lastUploadedShort = uploaded;

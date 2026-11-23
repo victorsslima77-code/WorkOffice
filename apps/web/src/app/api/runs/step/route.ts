@@ -32,7 +32,7 @@ export async function POST(request: NextRequest) {
     .limit(1)
     .maybeSingle();
 
-  if (activeWorker) {
+  if (activeWorker || process.env.ENABLE_SQL_MOCK_STEPPER !== 'true') {
     let runQuery = supabase
       .from('runs')
       .select('id, status')
@@ -53,12 +53,13 @@ export async function POST(request: NextRequest) {
         run_id: currentRun?.id ?? runId,
         run_status: currentRun?.status ?? 'idle',
         has_more: isStillRunning,
-        delegated_to_worker: activeWorker.worker_id,
+        delegated_to_worker: activeWorker?.worker_id ?? 'waiting_for_external_worker',
+        worker_online: Boolean(activeWorker),
       },
     });
   }
 
-  // Fallback somente quando não há Worker externo online: avança via RPC no Postgres
+  // Fallback SQL simulado somente quando explicitamente habilitado via ENABLE_SQL_MOCK_STEPPER=true
   const { data, error } = await supabase.rpc('advance_office_run_step', {
     p_office_id: officeId,
     p_run_id: runId,

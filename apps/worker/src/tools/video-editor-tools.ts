@@ -128,6 +128,8 @@ export function buildYtDlpSegmentArgs(params: {
 
   return [
     '--no-playlist',
+    '--extractor-args',
+    'youtube:player_client=android,web',
     '--download-sections',
     `*${params.startSec}-${params.endSec}`,
     '-f',
@@ -178,6 +180,7 @@ export async function renderShortVideoPackage(params: {
   hookText: string;
   bodyText: string;
   supabaseStorageClient?: SupabaseClient | null;
+  allowSyntheticFallback?: boolean;
 }): Promise<RenderedShortPackage> {
   validateSafeExternalUrl(params.sourceUrl);
   const durationSec = validateShortClipDuration(params.startSec, params.endSec);
@@ -203,6 +206,7 @@ export async function renderShortVideoPackage(params: {
     // 2. Caso o video de origem seja de sandbox ou o YouTube bloqueie o IP do datacenter, sintetiza um MP4 9:16 H.264+AAC valido
     if (process.env.ENABLE_NATIVE_FFMPEG === 'true') {
       let downloadedRealClip = false;
+      let ytDlpFailureReason = '';
       const isRealYoutubeWatchUrl =
         /^https?:\/\/(?:www\.|m\.)?youtube\.com\/watch\?v=[a-zA-Z0-9_-]{11}/.test(
           params.sourceUrl,
@@ -220,10 +224,15 @@ export async function renderShortVideoPackage(params: {
           const stat = await fs.stat(rawClipFile).catch(() => null);
           if (stat && stat.size > 4096) {
             downloadedRealClip = true;
+          } else {
+            ytDlpFailureReason = 'Arquivo baixado pelo yt-dlp ficou vazio (< 4 KB).';
           }
-        } catch {
+        } catch (err) {
           downloadedRealClip = false;
+          ytDlpFailureReason = (err as Error).message?.slice(0, 240) ?? 'Erro desconhecido no yt-dlp';
         }
+      } else {
+        ytDlpFailureReason = `URL de origem inválida ou não é um vídeo real do YouTube: ${params.sourceUrl}`;
       }
 
       if (downloadedRealClip) {
@@ -248,6 +257,13 @@ export async function renderShortVideoPackage(params: {
           mp4Buffer = await fs.readFile(outMp4File);
           usedNativeFfmpeg = true;
         }
+      } else if (
+        params.allowSyntheticFallback === false &&
+        process.env.ALLOW_SYNTHETIC_VIDEO_FALLBACK !== 'true'
+      ) {
+        throw new Error(
+          `Editor falhou ao baixar o vídeo real (${params.sourceUrl}) via yt-dlp: ${ytDlpFailureReason}`,
+        );
       } else {
         await execFileAsync('ffmpeg', [
           '-y',

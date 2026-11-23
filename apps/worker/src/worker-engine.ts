@@ -286,6 +286,7 @@ export async function processQueuedAgentTask(
       transcriptText: firstClip?.rationale,
       youtubeOAuth,
       supabaseStorageClient: storageClient,
+      isSandbox: apiKey.startsWith('wo_test_'),
       abortSignal: options?.abortSignal,
       emitVisualEvent: async (ev) => {
         await repo.insertAgentEvent({
@@ -320,7 +321,7 @@ export async function processQueuedAgentTask(
       task_id: task.id,
       agent_id: agent.id,
       provider: agent.provider,
-      model: agent.model,
+      model: llmResult.resolvedModel,
       effort: agent.effort,
       input_tokens: llmResult.inputTokens,
       output_tokens: llmResult.outputTokens,
@@ -490,8 +491,12 @@ export async function processQueuedAgentTask(
     return { status: 'completed', spawnedTaskIds };
   } catch (err) {
     const errMsg = (err as Error).message || 'Erro desconhecido na execucao da tarefa.';
+    const isNonRetryableApiError =
+      /\b(400|401|403|404)\b|bloqueou upload simulado|fallback mockup bloqueado|credenciais OAuth reais/i.test(
+        errMsg,
+      );
 
-    if (currentAttempt < maxAttempts && !options?.abortSignal?.aborted) {
+    if (currentAttempt < maxAttempts && !options?.abortSignal?.aborted && !isNonRetryableApiError) {
       const delaySec = calculateBackoffDelaySeconds(currentAttempt);
       await repo.updateTaskStatus(task.id, {
         status: 'queued',
@@ -508,6 +513,22 @@ export async function processQueuedAgentTask(
       });
       return { status: 'retried', spawnedTaskIds: [] };
     }
+
+    await repo
+      .insertLlmCall({
+        task_id: task.id,
+        agent_id: agent.id,
+        provider: agent.provider,
+        model: agent.model,
+        effort: agent.effort,
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cost_usd: 0,
+        latency_ms: 0,
+        error: errMsg.slice(0, 500),
+      })
+      .catch(() => {});
 
     await repo.updateTaskStatus(task.id, {
       status: 'failed',
