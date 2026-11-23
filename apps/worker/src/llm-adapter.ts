@@ -174,13 +174,14 @@ export async function runRoleWithMultiProviderLlm(
   // Monta o output estruturado para 1 unico video por vez, compativel com o schema Zod do cargo
   let rawOutput: unknown;
   if (req.roleSlug === 'scriptwriter') {
-    const startSec = 60 + vNum * 15;
+    const startSec = ctx.startSec ?? 30 + (vNum - 1) * 20;
+    const endSec = ctx.endSec ?? startSec + 45;
     rawOutput = {
       clips: [
         {
-          source_url: `https://www.youtube.com/watch?v=source_${vPad}`,
+          source_url: ctx.sourceUrl ?? `https://www.youtube.com/watch?v=source_${vPad}`,
           start_sec: startSec,
-          end_sec: startSec + 52,
+          end_sec: endSec,
           hook: customHookText,
           suggested_title: `${customHookText.slice(0, 75)} #shorts`,
           rationale: `Instrução clara de edição para o Vídeo #${vNum}/${ctx.totalVideos} sobre "${ctx.instruction}".`,

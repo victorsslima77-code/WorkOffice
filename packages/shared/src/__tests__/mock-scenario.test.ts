@@ -62,6 +62,12 @@ describe('@workoffice/shared — Etapa 4 (Entregas na Estante e Execucao Simulta
   it('extrai a quantidade de videos da instrucao e gera ondas simultaneas onde os 3 agentes trabalham ao mesmo tempo', () => {
     expect(parseRequestedVideoCount('Crie 10 vídeos do vídeo game novo')).toBe(10);
     expect(parseRequestedVideoCount('Faca 4 cortes sobre IA')).toBe(4);
+    expect(
+      parseRequestedVideoCount('Crie um video curto do youtuber Davy Jones falando sobre GTA 6'),
+    ).toBe(1);
+    expect(
+      parseRequestedVideoCount('Crie um video curto do youtuber Davy Jones falando sobre GTA'),
+    ).toBe(1);
 
     const mockAgents: VisualOfficeAgent[] = [
       {

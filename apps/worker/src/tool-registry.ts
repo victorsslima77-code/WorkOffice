@@ -90,6 +90,9 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         message: `Listando vídeos candidatos em ${channelUrl} (Vídeo #${ctx.videoIndex}/${ctx.totalVideos})`,
       });
       const videos = await listChannelOrTopicVideos(channelUrl, ctx.instruction, ctx.videoIndex);
+      if (videos[0]?.url) {
+        ctx.sourceUrl = videos[0].url;
+      }
       return { videos };
     },
   },
@@ -109,9 +112,17 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         type: 'research.read_source',
         toolName: 'fetch_transcript',
         progress: 65,
-        message: `Extraindo transcrição e timestamps para o Vídeo #${ctx.videoIndex}/${ctx.totalVideos}`,
+        message: `Extraindo transcrição e timestamps para o Vídeo #${ctx.videoIndex}/${ctx.totalVideos} (${sourceUrl})`,
       });
-      return extractBestTranscriptWindowForShort(sourceUrl, ctx.instruction, ctx.videoIndex);
+      const transcript = await extractBestTranscriptWindowForShort(
+        sourceUrl,
+        ctx.instruction,
+        ctx.videoIndex,
+      );
+      ctx.sourceUrl = sourceUrl;
+      ctx.startSec = transcript.startSec;
+      ctx.endSec = transcript.endSec;
+      return transcript;
     },
   },
 

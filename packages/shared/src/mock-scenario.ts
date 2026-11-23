@@ -190,12 +190,61 @@ export interface MockScenarioStep extends MockScenarioAction {
   concurrentActions?: MockScenarioAction[];
 }
 
+const PORTUGUESE_NUMBER_WORDS: Record<string, number> = {
+  um: 1,
+  uma: 1,
+  unico: 1,
+  único: 1,
+  dois: 2,
+  duas: 2,
+  tres: 3,
+  três: 3,
+  quatro: 4,
+  cinco: 5,
+  seis: 6,
+  sete: 7,
+  oito: 8,
+  nove: 9,
+  dez: 10,
+};
+
+/**
+ * Extrai a quantidade de videos solicitada na instrucao do usuario:
+ * - Reconhece digitos ou numerais por extenso ANTES de palavras como "video(s)", "short(s)", "corte(s)", "clipe(s)"
+ *   (ex: "Crie um video curto do Davy Jones falando sobre GTA 6" -> retorna 1, ignorando o "6" de "GTA 6"!).
+ * - Se encontrar um numero isolado apenas quando nao houver substantivo (ex: "Crie 4 do tema X"), usa esse numero.
+ * - Padrao quando nenhuma quantidade explicita for informada: 1 video.
+ */
 export function parseRequestedVideoCount(instruction: string): number {
-  const match = instruction.match(/\b(\d{1,2})\b/);
-  if (!match?.[1]) return 3;
-  const num = Number(match[1]);
-  if (Number.isNaN(num) || num < 1) return 3;
-  return Math.min(10, num);
+  const clean = instruction.trim().toLowerCase();
+  if (!clean) return 1;
+
+  // 1. Procura especificamente "<numero ou palavra> [adjetivo opcional] (videos|shorts|cortes|clipes)"
+  const explicitMatch = clean.match(
+    /\b(\d{1,2}|um|uma|único|unico|dois|duas|três|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+(?:novo[s]?\s+|curto[s]?\s+)?(?:v[ií]deos?|shorts?|cortes?|clipes?)\b/i,
+  );
+
+  if (explicitMatch?.[1]) {
+    const token = explicitMatch[1].toLowerCase();
+    const parsedNum = PORTUGUESE_NUMBER_WORDS[token] ?? Number(token);
+    if (!Number.isNaN(parsedNum) && parsedNum >= 1) {
+      return Math.min(10, parsedNum);
+    }
+  }
+
+  // 2. Procura padrao logo apos o verbo inicial: "crie/faca/gere <numero>"
+  const verbMatch = clean.match(
+    /\b(?:crie|criar|fa[cç]a|fazer|gere|gerar|produza|produzir)\s+(\d{1,2}|um|uma|dois|duas|três|tres|quatro|cinco|seis|sete|oito|nove|dez)\b/i,
+  );
+  if (verbMatch?.[1]) {
+    const token = verbMatch[1].toLowerCase();
+    const parsedNum = PORTUGUESE_NUMBER_WORDS[token] ?? Number(token);
+    if (!Number.isNaN(parsedNum) && parsedNum >= 1) {
+      return Math.min(10, parsedNum);
+    }
+  }
+
+  return 1;
 }
 
 /**

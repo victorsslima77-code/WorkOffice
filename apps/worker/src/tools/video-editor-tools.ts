@@ -188,6 +188,7 @@ export async function renderShortVideoPackage(params: {
   const srtContent = buildDynamicSrtSubtitles(params.hookText, params.bodyText, durationSec);
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `wo-task-${params.taskId.slice(0, 8)}-`));
+  const rawClipFile = path.join(tmpDir, `raw_${vPad}.mp4`);
   const srtFile = path.join(tmpDir, `short_${vPad}.srt`);
   const outMp4File = path.join(tmpDir, `short_${vPad}_9x16.mp4`);
 
@@ -197,24 +198,85 @@ export async function renderShortVideoPackage(params: {
   try {
     await fs.writeFile(srtFile, srtContent, 'utf8');
 
-    // Se ENABLE_NATIVE_FFMPEG=true e ffmpeg estiver instalado no container, gera um MP4 9:16 real
+    // Se ENABLE_NATIVE_FFMPEG=true e ffmpeg/yt-dlp estiverem instalados no container:
+    // 1. Tenta baixar o segmento real do YouTube via yt-dlp e recortar em 9:16 com burn-in de legenda via ffmpeg
+    // 2. Caso o video de origem seja de sandbox ou o YouTube bloqueie o IP do datacenter, sintetiza um MP4 9:16 H.264+AAC valido
     if (process.env.ENABLE_NATIVE_FFMPEG === 'true') {
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-f',
-        'lavfi',
-        '-i',
-        `color=c=0x0f172a:s=1080x1920:d=${Math.min(5, durationSec)}`,
-        '-c:v',
-        'libx264',
-        '-t',
-        String(Math.min(5, durationSec)),
-        '-pix_fmt',
-        'yuv420p',
-        outMp4File,
-      ]);
-      mp4Buffer = await fs.readFile(outMp4File);
-      usedNativeFfmpeg = true;
+      let downloadedRealClip = false;
+      const isRealYoutubeWatchUrl =
+        /^https?:\/\/(?:www\.|m\.)?youtube\.com\/watch\?v=[a-zA-Z0-9_-]{11}/.test(
+          params.sourceUrl,
+        ) || /^https?:\/\/youtu\.be\/[a-zA-Z0-9_-]{11}/.test(params.sourceUrl);
+
+      if (isRealYoutubeWatchUrl) {
+        try {
+          const ytdlpArgs = buildYtDlpSegmentArgs({
+            sourceUrl: params.sourceUrl,
+            startSec: params.startSec,
+            endSec: params.endSec,
+            outputTemplatePath: rawClipFile,
+          });
+          await execFileAsync('yt-dlp', ytdlpArgs, { timeout: 60_000 });
+          const stat = await fs.stat(rawClipFile).catch(() => null);
+          if (stat && stat.size > 4096) {
+            downloadedRealClip = true;
+          }
+        } catch {
+          downloadedRealClip = false;
+        }
+      }
+
+      if (downloadedRealClip) {
+        try {
+          const ffmpegArgs = buildFfmpegVerticalShortArgs({
+            inputVideoPath: rawClipFile,
+            outputVideoPath: outMp4File,
+            subtitleSrtPath: srtFile,
+            durationSec,
+          });
+          await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 60_000 });
+          mp4Buffer = await fs.readFile(outMp4File);
+          usedNativeFfmpeg = true;
+        } catch {
+          // Se o filtro de legenda libass nao estiver compilado, recorta o video real em 9:16 sem o filtro subtitles
+          const fallbackFfmpegArgs = buildFfmpegVerticalShortArgs({
+            inputVideoPath: rawClipFile,
+            outputVideoPath: outMp4File,
+            durationSec,
+          });
+          await execFileAsync('ffmpeg', fallbackFfmpegArgs, { timeout: 60_000 });
+          mp4Buffer = await fs.readFile(outMp4File);
+          usedNativeFfmpeg = true;
+        }
+      } else {
+        await execFileAsync('ffmpeg', [
+          '-y',
+          '-f',
+          'lavfi',
+          '-i',
+          `color=c=0x0f172a:s=1080x1920:d=${Math.min(5, durationSec)}:r=30`,
+          '-f',
+          'lavfi',
+          '-i',
+          'anullsrc=channel_layout=stereo:sample_rate=44100',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'ultrafast',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-shortest',
+          '-t',
+          String(Math.min(5, durationSec)),
+          outMp4File,
+        ]);
+        mp4Buffer = await fs.readFile(outMp4File);
+        usedNativeFfmpeg = true;
+      }
     } else {
       mp4Buffer = createMinimalValidMp4Buffer(`${storageVideoPath} (${durationSec}s)`);
     }

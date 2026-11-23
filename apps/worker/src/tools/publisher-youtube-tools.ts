@@ -135,9 +135,15 @@ export async function exchangeYoutubeRefreshToken(
   const refreshToken =
     typeof oauthOrToken === 'string' ? oauthOrToken.trim() : oauthOrToken.refreshToken.trim();
   const clientId =
-    typeof oauthOrToken === 'string' ? '' : (oauthOrToken.clientId?.trim() ?? '');
+    (typeof oauthOrToken === 'string' ? '' : (oauthOrToken.clientId?.trim() ?? '')) ||
+    process.env.GOOGLE_OAUTH_CLIENT_ID?.trim() ||
+    process.env.OAUTH_CLIENT_ID?.trim() ||
+    '';
   const clientSecret =
-    typeof oauthOrToken === 'string' ? '' : (oauthOrToken.clientSecret?.trim() ?? '');
+    (typeof oauthOrToken === 'string' ? '' : (oauthOrToken.clientSecret?.trim() ?? '')) ||
+    process.env.GOOGLE_OAUTH_CLIENT_SECRET?.trim() ||
+    process.env.OAUTH_CLIENT_SECRET?.trim() ||
+    '';
 
   if (
     !refreshToken ||
@@ -307,7 +313,7 @@ export async function uploadShortToYoutubeChannel(
     quotaUnitsConsumed: plan.quotaUnitsConsumed,
     dailyQuotaLimitVideos: plan.dailyQuotaLimitVideos,
     scheduleDetails: null,
-    outputSummary: plan.outputSummary,
+    outputSummary: `[MODO SANDBOX — Salve Client ID, Client Secret e Refresh Token reais no Cofre do Escritório para publicar no YouTube real] URL Simulada: ${plan.shortUrl}`,
     mode: 'sandbox_channel',
   };
 }
