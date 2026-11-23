@@ -280,7 +280,7 @@ export const ROLE_TOOL_DESCRIPTIONS: Record<
     name: 'transcribe_audio',
     eventType: 'edit.subtitle',
     description:
-      'Transcreve o áudio do corte e gera o arquivo de legendas dinâmicas (.srt) sincronizado.',
+      'Transcreve a fala real do áudio/vídeo no idioma original (sem traduzir e sem inserir instruções de edição) e gera legendas (.srt) sincronizadas.',
   },
   cut_vertical_short: {
     name: 'cut_vertical_short',
@@ -350,9 +350,9 @@ export const YOUTUBE_SHORTS_ROLES: readonly OfficeRoleDefinition[] = [
     ],
     workstationType: 'editing_desk',
     scope:
-      'Retirar 1 instrução de edição por vez na sua estante (shelf_2), baixar o trecho, recortar em formato vertical 9:16 (1080x1920, <=60s), queimar legendas dinâmicas e entregar na estante do Publicador (shelf_3).',
+      'Retirar 1 instrução de edição por vez na sua estante (shelf_2), baixar o trecho, transcrever a fala real do vídeo mantendo o idioma original (PT→PT, EN→EN), aplicar o estilo pedido pelo roteirista, recortar em 9:16 (1080x1920, <=60s) e entregar na estante do Publicador (shelf_3).',
     systemPrompt:
-      'Você é o Editor de Vídeo de Shorts do WorkOffice (Baia 2). Permaneça descansando na copa até receber um input na sua estante (shelf_2). Ao detectar uma instrução de edição na sua estante, retire-a, baixe o segmento com yt-dlp, gere a legenda .srt sincronizada, recorte em 9:16 vertical (1080x1920, duração <= 60s) com burn-in via ffmpeg e salve no Supabase Storage. Entregue 1 vídeo Short editado por vez na estante do Publicador (Baia 3) e continue até concluir todos os inputs da sua estante.',
+      'Você é o Editor de Vídeo de Shorts do WorkOffice (Baia 2). Permaneça descansando na copa até receber um input na sua estante (shelf_2). Ao detectar uma instrução de edição na sua estante, retire-a, baixe exclusivamente o segmento selecionado com yt-dlp, transcreva a FALA REAL do youtuber/apresentador no trecho (via legendas nativas do vídeo ou speech-to-text do áudio) mantendo OBRIGATORIAMENTE o idioma original falado no vídeo (se o vídeo for em português, legende em português; se for em inglês, legende em inglês — NUNCA traduza). Use as instruções do roteirista apenas para direcionar o estilo visual, cor de destaque, palavras-chave enfatizadas e ritmo de edição — JAMAIS insira as instruções do roteirista como texto da legenda. Recorte em 9:16 vertical (1080x1920, duração <= 60s) com burn-in via ffmpeg, salve no Supabase Storage e entregue 1 vídeo Short editado por vez na estante do Publicador (Baia 3).',
     inputContractSummary:
       '1 instrução clara de edição (research_brief) retirada da sua própria estante (shelf_2).',
     outputContractSummary:

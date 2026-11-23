@@ -105,7 +105,16 @@ interface ParsedScriptwriterLlmJson {
   score?: number;
 }
 
-function tryParseJsonFromLlmText(text: string): ParsedScriptwriterLlmJson | null {
+interface ParsedVideoEditorLlmJson {
+  subtitle_accent_color?: 'yellow' | 'red' | 'white' | 'green';
+  highlight_words?: string[];
+  apply_dynamic_zoom?: boolean;
+  polished_cues?: { startSec: number; endSec: number; text: string }[];
+  suggested_title?: string;
+  editing_notes?: string;
+}
+
+function tryParseJsonFromLlmText<T = ParsedScriptwriterLlmJson>(text: string): T | null {
   const cleaned = text
     .replace(/```json\s*/gi, '')
     .replace(/```\s*/g, '')
@@ -118,7 +127,7 @@ function tryParseJsonFromLlmText(text: string): ParsedScriptwriterLlmJson | null
   }
 
   try {
-    return JSON.parse(cleaned.slice(startIdx, endIdx + 1)) as ParsedScriptwriterLlmJson;
+    return JSON.parse(cleaned.slice(startIdx, endIdx + 1)) as T;
   } catch {
     return null;
   }
@@ -408,11 +417,10 @@ export async function runRoleWithMultiProviderLlm(
     await executeRegisteredTool('youtube_list_videos', {}, ctx);
     await executeRegisteredTool('fetch_transcript', {}, ctx);
   } else if (req.roleSlug === 'video_editor') {
+    // 1a fase do Editor: baixa o trecho real e transcreve a FALA REAL do video no idioma original
+    // ANTES de chamar o LLM Editor (para o LLM revisar estilo/destaques seguindo o roteirista sem inventar falas!)
     await executeRegisteredTool('download_video_segment', {}, ctx);
-    await executeRegisteredTool('cut_vertical_short', {}, ctx);
     await executeRegisteredTool('transcribe_audio', {}, ctx);
-    await executeRegisteredTool('burn_subtitles', {}, ctx);
-    await executeRegisteredTool('upload_artifact', {}, ctx);
   } else if (req.roleSlug === 'publisher_analyst') {
     await executeRegisteredTool('youtube_upload_short', {}, ctx);
     await executeRegisteredTool('youtube_schedule_video', {}, ctx);
@@ -427,6 +435,7 @@ export async function runRoleWithMultiProviderLlm(
     effortCfg.thinkingBudgetTokens > 0 ? Math.round(effortCfg.thinkingBudgetTokens * 0.35) : 0;
 
   let parsedScriptJson: ParsedScriptwriterLlmJson | null = null;
+  let parsedEditorJson: ParsedVideoEditorLlmJson | null = null;
   let generatedTitleFallback: string | null = null;
 
   if (!isSandboxKey) {
@@ -467,6 +476,33 @@ export async function runRoleWithMultiProviderLlm(
       ]
         .filter(Boolean)
         .join('\n\n');
+    } else if (req.roleSlug === 'video_editor') {
+      const cuesPreview = (ctx.spokenSubtitleCues ?? []).slice(0, 45);
+      const detectedLang = ctx.detectedVideoLanguage ?? 'original';
+      rolePrompt = [
+        `Você recebeu a transcrição da FALA REAL do youtuber no corte (${ctx.startSec ?? 0}s–${ctx.endSec ?? 45}s) e as instruções de edição do Roteirista.`,
+        `Idioma original falado no vídeo: "${detectedLang}".`,
+        `Instruções do Roteirista (APENAS para estilo visual, ritmo, zoom e destaques — JAMAIS coloque essas instruções dentro da legenda!):`,
+        `"${ctx.editingInstructions ?? 'Manter ritmo dinâmico e legendas legíveis.'}"`,
+        cuesPreview.length > 0
+          ? `Falas reais extraídas do áudio do vídeo (JSON):\n${JSON.stringify(cuesPreview)}`
+          : `Nenhuma fala foi detectada no áudio do vídeo.`,
+        `REGRAS OBRIGATÓRIAS:`,
+        `1. JAMAIS insira instruções do roteirista (como "abra com zoom", "cortes dinâmicos", "destaque em vermelho") no texto das legendas.`,
+        `2. MANTENHA 100% O IDIOMA ORIGINAL DO VÍDEO ("${detectedLang}"): se o youtuber fala em português, legende em português; se fala em inglês, legende em inglês. NUNCA traduza.`,
+        `3. Em "polished_cues", devolva EXATAMENTE a mesma quantidade de blocos e os mesmos timestamps (startSec/endSec), fazendo apenas correção mínima de pontuação/grafia na fala real transcrita (ou lista vazia se não houver falas).`,
+        `4. Em "highlight_words", liste de 2 a 6 palavras/expressões REAIS que aparecem nas falas acima (no idioma original "${detectedLang}") para destacar conforme o estilo pedido pelo roteirista.`,
+        `5. Em "subtitle_accent_color", escolha "red", "yellow", "green" ou "white" seguindo o pedido do roteirista (padrão "yellow").`,
+        `Retorne APENAS um JSON válido:`,
+        `{`,
+        `  "subtitle_accent_color": "yellow",`,
+        `  "highlight_words": ["..."],`,
+        `  "apply_dynamic_zoom": true,`,
+        `  "suggested_title": "${(ctx.suggestedTitle ?? '').replace(/"/g, "'")}",`,
+        `  "editing_notes": "<resumo curto do estilo aplicado>",`,
+        `  "polished_cues": [{"startSec": 0, "endSec": 2.5, "text": "<fala real no idioma original>"}]`,
+        `}`,
+      ].join('\n\n');
     } else {
       rolePrompt = `Crie um título viral curto (máx 80 caracteres, terminando com #shorts) em português para o Vídeo #${vNum}/${ctx.totalVideos} baseado no tema "${ctx.suggestedTitle ?? ctx.instruction}". Retorne apenas o título.`;
     }
@@ -618,7 +654,12 @@ export async function runRoleWithMultiProviderLlm(
 
     if (rawText) {
       if (req.roleSlug === 'scriptwriter') {
-        parsedScriptJson = tryParseJsonFromLlmText(rawText);
+        parsedScriptJson = tryParseJsonFromLlmText<ParsedScriptwriterLlmJson>(rawText);
+      } else if (req.roleSlug === 'video_editor') {
+        parsedEditorJson = tryParseJsonFromLlmText<ParsedVideoEditorLlmJson>(rawText);
+        if (parsedEditorJson?.suggested_title?.trim()) {
+          generatedTitleFallback = parsedEditorJson.suggested_title.trim().slice(0, 95);
+        }
       } else {
         generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
       }
@@ -631,13 +672,71 @@ export async function runRoleWithMultiProviderLlm(
     }
   }
 
+  // 2a fase do Editor: aplica estilo/destaques decididos pelo LLM Editor sobre a FALA REAL transcrita
+  // e executa corte 9:16 + burn-in de legendas reais + upload no Storage!
+  if (req.roleSlug === 'video_editor') {
+    const allowedColors = new Set(['yellow', 'red', 'white', 'green']);
+    const inferredColorFromInstructions = /vermelh|red/i.test(ctx.editingInstructions ?? '')
+      ? 'red'
+      : /verde|green/i.test(ctx.editingInstructions ?? '')
+        ? 'green'
+        : 'yellow';
+
+    ctx.subtitleStyle = {
+      accentColor:
+        parsedEditorJson?.subtitle_accent_color &&
+        allowedColors.has(parsedEditorJson.subtitle_accent_color)
+          ? parsedEditorJson.subtitle_accent_color
+          : inferredColorFromInstructions,
+      highlightWords: Array.isArray(parsedEditorJson?.highlight_words)
+        ? parsedEditorJson.highlight_words
+            .map((w) => String(w).trim())
+            .filter((w) => w.length >= 2)
+            .slice(0, 8)
+        : [],
+      applyDynamicZoom:
+        typeof parsedEditorJson?.apply_dynamic_zoom === 'boolean'
+          ? parsedEditorJson.apply_dynamic_zoom
+          : /zoom/i.test(ctx.editingInstructions ?? ''),
+    };
+
+    // Aceita polished_cues SOMENTE se mantiver o mesmo numero de blocos e nao vazar instrucoes de edicao!
+    const origCues = ctx.spokenSubtitleCues ?? [];
+    const candidatePolished = parsedEditorJson?.polished_cues;
+    if (
+      origCues.length > 0 &&
+      Array.isArray(candidatePolished) &&
+      candidatePolished.length === origCues.length
+    ) {
+      const directorLeakPattern =
+        /abra com zoom|cortes din[aâ]micos|destaque em vermelho|ritmo acelerado|transi[cç][õo]es de/i;
+      const allClean = candidatePolished.every(
+        (c) =>
+          typeof c.text === 'string' &&
+          c.text.trim().length > 0 &&
+          !directorLeakPattern.test(c.text),
+      );
+      if (allClean) {
+        ctx.spokenSubtitleCues = origCues.map((orig, idx) => ({
+          startSec: orig.startSec,
+          endSec: orig.endSec,
+          text: candidatePolished[idx]!.text.trim(),
+        }));
+      }
+    }
+
+    await executeRegisteredTool('cut_vertical_short', {}, ctx);
+    await executeRegisteredTool('burn_subtitles', {}, ctx);
+    await executeRegisteredTool('upload_artifact', {}, ctx);
+  }
+
   // Monta o output estruturado para 1 unico video por vez, compativel com o schema Zod do cargo
   let rawOutput: unknown;
   if (req.roleSlug === 'scriptwriter') {
     const validCandidateUrls = new Set((ctx.candidateVideos ?? []).map((v) => v.url));
     const llmChosenUrl =
       parsedScriptJson?.source_url &&
-      (validCandidateUrls.size === 0 || validCandidateUrls.has(parsedScriptJson.source_url))
+        (validCandidateUrls.size === 0 || validCandidateUrls.has(parsedScriptJson.source_url))
         ? parsedScriptJson.source_url
         : undefined;
 
@@ -659,8 +758,8 @@ export async function runRoleWithMultiProviderLlm(
 
     const rawEnd =
       typeof parsedScriptJson?.end_sec === 'number' &&
-      parsedScriptJson.end_sec > rawStart &&
-      parsedScriptJson.end_sec - rawStart <= 60
+        parsedScriptJson.end_sec > rawStart &&
+        parsedScriptJson.end_sec - rawStart <= 60
         ? Math.round(parsedScriptJson.end_sec)
         : Math.min(rawStart + 45, (ctx.sourceDurationSec ?? 600));
 
@@ -689,8 +788,8 @@ export async function runRoleWithMultiProviderLlm(
 
     const finalScore =
       typeof parsedScriptJson?.score === 'number' &&
-      parsedScriptJson.score >= 0 &&
-      parsedScriptJson.score <= 100
+        parsedScriptJson.score >= 0 &&
+        parsedScriptJson.score <= 100
         ? Math.round(parsedScriptJson.score)
         : Math.min(99, 89 + (vNum % 10));
 
@@ -710,9 +809,9 @@ export async function runRoleWithMultiProviderLlm(
   } else if (req.roleSlug === 'video_editor') {
     const finalDuration =
       ctx.startSec !== undefined &&
-      ctx.endSec !== undefined &&
-      ctx.endSec > ctx.startSec &&
-      ctx.endSec - ctx.startSec <= 60
+        ctx.endSec !== undefined &&
+        ctx.endSec > ctx.startSec &&
+        ctx.endSec - ctx.startSec <= 60
         ? ctx.endSec - ctx.startSec
         : 45;
     rawOutput = {

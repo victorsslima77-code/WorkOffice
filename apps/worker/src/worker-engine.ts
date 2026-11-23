@@ -1,3 +1,4 @@
+import fs from 'node:fs/promises';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   getDefaultNextDeskSlot,
@@ -218,6 +219,8 @@ export async function processQueuedAgentTask(
   });
   await repo.updateAgentStatus(agent.id, 'working');
 
+  let tempWorkDirToClean: string | undefined;
+
   try {
     // 2. Para comecar a tarefa, o funcionario pega o input na sua propria estante (own_shelf)
     if (agent.role_slug !== 'scriptwriter' || videoIndex === 1) {
@@ -283,7 +286,9 @@ export async function processQueuedAgentTask(
       endSec: firstClip?.end_sec,
       suggestedTitle: firstEdited?.suggested_title ?? firstClip?.suggested_title,
       hookText: firstClip?.hook,
-      transcriptText: firstClip?.rationale,
+      editingInstructions: firstClip?.rationale,
+      llmProvider: agent.provider,
+      llmApiKey: apiKey,
       youtubeOAuth,
       supabaseStorageClient: storageClient,
       isSandbox: apiKey.startsWith('wo_test_'),
@@ -316,6 +321,7 @@ export async function processQueuedAgentTask(
       roleSlug: agent.role_slug,
       toolContext,
     });
+    tempWorkDirToClean = toolContext.tempWorkDir;
 
     await repo.insertLlmCall({
       task_id: task.id,
@@ -359,6 +365,13 @@ export async function processQueuedAgentTask(
       metadata: {
         video_index: videoIndex,
         total_videos: totalVideos,
+        ...(agent.role_slug === 'video_editor'
+          ? {
+              detected_language: toolContext.detectedVideoLanguage ?? 'unknown',
+              subtitle_source: toolContext.subtitleSource ?? 'none',
+              subtitle_cues_count: toolContext.spokenSubtitleCues?.length ?? 0,
+            }
+          : {}),
         output: validatedOutput,
       },
     });
@@ -549,5 +562,9 @@ export async function processQueuedAgentTask(
     await repo.updateRunTotalsAndStatus(task.run_id, 0, 0, 'failed');
 
     return { status: 'failed', spawnedTaskIds: [] };
+  } finally {
+    if (tempWorkDirToClean) {
+      await fs.rm(tempWorkDirToClean, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }

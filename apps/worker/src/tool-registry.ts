@@ -1,5 +1,8 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { AgentEventType, DeskSlot, RoleSlug } from '@workoffice/shared';
+import type { AgentEventType, DeskSlot, LlmProvider, RoleSlug } from '@workoffice/shared';
 import {
   fetchShortAnalyticsSnapshot,
   uploadShortToYoutubeChannel,
@@ -13,8 +16,12 @@ import {
   type CandidatePodcastVideo,
 } from './tools/scriptwriter-tools.js';
 import {
-  buildDynamicSrtSubtitles,
+  downloadVideoSegmentToFile,
+  extractSpokenSubtitlesFromClip,
+  formatCuesToSrt,
   renderShortVideoPackage,
+  type EditorSubtitleStyle,
+  type SpokenSubtitleCue,
 } from './tools/video-editor-tools.js';
 
 export class ToolPermissionError extends Error {
@@ -40,6 +47,22 @@ export interface ToolExecutionContext {
   sourceDurationSec?: number;
   candidateVideos?: CandidatePodcastVideo[];
   transcriptText?: string;
+  /** Instrucoes de edicao do roteirista (rationale) — usadas apenas para guiar estilo/ritmo, NUNCA como texto de legenda! */
+  editingInstructions?: string;
+  /** Idioma original falado detectado no video (ex: "pt", "en") — preservado estritamente nas legendas */
+  detectedVideoLanguage?: string;
+  /** Falas reais transcritas do video com timestamps relativos ao corte (0..duracao) */
+  spokenSubtitleCues?: SpokenSubtitleCue[];
+  /** Origem da transcricao real das falas */
+  subtitleSource?: string;
+  /** Estilo visual das legendas/corte derivado das instrucoes do roteirista */
+  subtitleStyle?: EditorSubtitleStyle;
+  /** Caminho temporario local do trecho baixado pelo yt-dlp para reutilizacao entre transcricao e ffmpeg */
+  downloadedClipPath?: string;
+  /** Diretorio temporario de trabalho do clipe (limpo ao final da task) */
+  tempWorkDir?: string;
+  llmProvider?: LlmProvider;
+  llmApiKey?: string;
   suggestedTitle?: string;
   hookText?: string;
   startSec?: number;
@@ -177,7 +200,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
   // 2. Ferramentas Reais do Editor de Video (video_editor)
   download_video_segment: {
     name: 'download_video_segment',
-    description: 'Valida URL contra SSRF e prepara segmento especifico via yt-dlp.',
+    description: 'Valida URL contra SSRF e baixa exclusivamente o segmento selecionado via yt-dlp.',
     visualEventType: 'edit.download',
     defaultProgress: 25,
     async execute(args, ctx) {
@@ -188,36 +211,93 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         );
       }
       const sourceUrl = candidateUrl ?? 'https://www.youtube.com/watch?v=demo';
+      const startSec = ctx.startSec ?? 0;
+      const endSec = ctx.endSec ?? Math.min(startSec + 45, 60);
+
       await ctx.emitVisualEvent({
         type: 'edit.download',
         toolName: 'download_video_segment',
         progress: 25,
-        message: `Baixando trecho bruto do Vídeo #${ctx.videoIndex}/${ctx.totalVideos} (${sourceUrl})`,
+        message: `Baixando trecho bruto (${startSec}s–${endSec}s) do Vídeo #${ctx.videoIndex}/${ctx.totalVideos} (${sourceUrl})`,
       });
-      return { local_raw_path: `/tmp/raw_video_${ctx.videoIndex}.mp4`, source_url: sourceUrl };
+
+      if (!ctx.tempWorkDir) {
+        ctx.tempWorkDir = await fs.mkdtemp(
+          path.join(os.tmpdir(), `wo-edit-${ctx.taskId.slice(0, 8)}-`),
+        );
+      }
+      const vPad = String(ctx.videoIndex).padStart(2, '0');
+      const rawClipPath = path.join(ctx.tempWorkDir, `raw_${vPad}.mp4`);
+
+      if (process.env.ENABLE_NATIVE_FFMPEG === 'true' && !ctx.isSandbox) {
+        const dl = await downloadVideoSegmentToFile({
+          sourceUrl,
+          startSec,
+          endSec,
+          outputPath: rawClipPath,
+        });
+        if (dl.ok) {
+          ctx.downloadedClipPath = rawClipPath;
+        } else if (process.env.ALLOW_SYNTHETIC_VIDEO_FALLBACK !== 'true') {
+          throw new Error(
+            `Editor falhou ao baixar o vídeo real (${sourceUrl}) via yt-dlp: ${dl.reason ?? 'erro desconhecido'}`,
+          );
+        }
+      }
+
+      return { local_raw_path: ctx.downloadedClipPath ?? rawClipPath, source_url: sourceUrl };
     },
   },
 
   transcribe_audio: {
     name: 'transcribe_audio',
-    description: 'Gera arquivo de legenda .srt sincronizado palavra por palavra.',
+    description:
+      'Transcreve a fala real do video mantendo obrigatoriamente o idioma original (PT->PT, EN->EN) sem traduzir e sem inserir instrucoes do roteirista.',
     visualEventType: 'edit.subtitle',
     defaultProgress: 50,
     async execute(_args, ctx) {
       const vPad = String(ctx.videoIndex).padStart(2, '0');
-      const srt = buildDynamicSrtSubtitles(
-        `Gancho do Vídeo #${ctx.videoIndex}: ${ctx.instruction}`,
-        `Conteúdo principal editado e legendado sobre ${ctx.instruction}.`,
-        52,
-      );
+      const startSec = ctx.startSec ?? 0;
+      const endSec = ctx.endSec ?? Math.min(startSec + 45, 60);
+      const sourceUrl = ctx.sourceUrl ?? 'https://www.youtube.com/watch?v=demo';
+
+      if (!ctx.tempWorkDir) {
+        ctx.tempWorkDir = await fs.mkdtemp(
+          path.join(os.tmpdir(), `wo-edit-${ctx.taskId.slice(0, 8)}-`),
+        );
+      }
+
+      const extracted = await extractSpokenSubtitlesFromClip({
+        sourceUrl,
+        startSec,
+        endSec,
+        rawClipPath: ctx.downloadedClipPath,
+        workDir: ctx.tempWorkDir,
+        provider: ctx.llmProvider,
+        apiKey: ctx.llmApiKey,
+        isSandbox: Boolean(ctx.isSandbox),
+      });
+
+      ctx.detectedVideoLanguage = extracted.language;
+      ctx.spokenSubtitleCues = extracted.cues;
+      ctx.subtitleSource = extracted.source;
+
+      const srt = formatCuesToSrt(extracted.cues);
       await ctx.emitVisualEvent({
         type: 'edit.subtitle',
         toolName: 'transcribe_audio',
         progress: 50,
-        message: `Legendas (.srt) geradas para o Vídeo #${ctx.videoIndex}/${ctx.totalVideos}`,
+        message:
+          extracted.cues.length > 0
+            ? `Fala real transcrita (${extracted.cues.length} legendas no idioma original "${extracted.language}" via ${extracted.source}) para o Vídeo #${ctx.videoIndex}/${ctx.totalVideos}`
+            : `Nenhuma fala detectada para legendar no trecho (${extracted.language}); mantendo vídeo limpo sem inserir instruções do roteirista.`,
       });
+
       return {
         subtitle_path: `${ctx.officeId}/${ctx.runId}/short_${vPad}.srt`,
+        detected_language: extracted.language,
+        subtitle_source: extracted.source,
+        cues_count: extracted.cues.length,
         srt_content: srt,
       };
     },
@@ -229,35 +309,43 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     visualEventType: 'edit.cut',
     defaultProgress: 75,
     async execute(_args, ctx) {
+      const startSec = ctx.startSec ?? 0;
+      const endSec = ctx.endSec ?? 45;
+      const dur = Math.max(1, Math.min(60, endSec - startSec));
       await ctx.emitVisualEvent({
         type: 'edit.cut',
         toolName: 'cut_vertical_short',
         progress: 75,
-        message: `Cortando Vídeo #${ctx.videoIndex}/${ctx.totalVideos} em 9:16 vertical (1080x1920) com ffmpeg`,
+        message: `Cortando Vídeo #${ctx.videoIndex}/${ctx.totalVideos} em 9:16 vertical (1080x1920 • ${dur}s) com ffmpeg`,
       });
-      return { duration_sec: 52, resolution: '1080x1920' };
+      return { duration_sec: dur, resolution: '1080x1920' };
     },
   },
 
   burn_subtitles: {
     name: 'burn_subtitles',
-    description: 'Renderiza o burn-in das legendas estilizadas no video vertical.',
+    description: 'Renderiza o burn-in das legendas estilizadas da fala real no video vertical.',
     visualEventType: 'edit.render',
     defaultProgress: 90,
     async execute(_args, ctx) {
+      const lang = ctx.detectedVideoLanguage ?? 'original';
+      const count = ctx.spokenSubtitleCues?.length ?? 0;
       await ctx.emitVisualEvent({
         type: 'edit.render',
         toolName: 'burn_subtitles',
         progress: 90,
-        message: `Renderizando burn-in de legendas no Vídeo #${ctx.videoIndex}/${ctx.totalVideos}`,
+        message:
+          count > 0
+            ? `Aplicando burn-in de ${count} legendas da fala real (idioma "${lang}") no Vídeo #${ctx.videoIndex}/${ctx.totalVideos}`
+            : `Renderizando Vídeo #${ctx.videoIndex}/${ctx.totalVideos} em 9:16 (sem legendas sintéticas)`,
       });
-      return { rendered: true };
+      return { rendered: true, cues_count: count, language: lang };
     },
   },
 
   upload_artifact: {
     name: 'upload_artifact',
-    description: 'Gera o pacote MP4 vertical + SRT e envia para os buckets privados no Supabase Storage.',
+    description: 'Gera o pacote MP4 vertical + SRT da fala real e envia para os buckets privados no Supabase Storage.',
     visualEventType: 'edit.render',
     defaultProgress: 100,
     async execute(_args, ctx) {
@@ -278,10 +366,11 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         sourceUrl,
         startSec,
         endSec,
-        hookText: ctx.hookText ?? `Vídeo #${ctx.videoIndex}: ${ctx.instruction}`,
-        bodyText:
-          ctx.transcriptText ??
-          `Corte vertical 9:16 com legendas sincronizadas para ${ctx.instruction}.`,
+        hookText: ctx.hookText ?? '',
+        bodyText: '',
+        spokenCues: ctx.spokenSubtitleCues,
+        subtitleStyle: ctx.subtitleStyle,
+        preDownloadedRawClipPath: ctx.downloadedClipPath,
         supabaseStorageClient: ctx.supabaseStorageClient,
         allowSyntheticFallback: Boolean(ctx.isSandbox),
       });
@@ -290,7 +379,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         type: 'edit.render',
         toolName: 'upload_artifact',
         progress: 100,
-        message: `Short #${ctx.videoIndex}/${ctx.totalVideos} renderizado e salvo no Storage (${pkg.storageVideoPath})`,
+        message: `Short #${ctx.videoIndex}/${ctx.totalVideos} renderizado (${pkg.subtitleCuesCount} legendas • idioma ${ctx.detectedVideoLanguage ?? 'original'}) e salvo no Storage (${pkg.storageVideoPath})`,
       });
 
       return {
@@ -299,6 +388,9 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         duration_sec: pkg.durationSec,
         resolution: pkg.resolution,
         byte_size: pkg.mp4Buffer.byteLength,
+        detected_language: ctx.detectedVideoLanguage ?? 'unknown',
+        subtitle_source: ctx.subtitleSource ?? 'none',
+        subtitle_cues_count: pkg.subtitleCuesCount,
       };
     },
   },
