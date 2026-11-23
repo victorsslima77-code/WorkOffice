@@ -8,6 +8,7 @@ import {
   type VisualOfficeAgent,
 } from '@workoffice/shared';
 import { useEffect, useState } from 'react';
+import { formatMoneyFromUsd, type DisplayCurrency } from '@/lib/currency';
 
 export interface TraceTaskItem {
   id: string;
@@ -38,7 +39,10 @@ interface OfficeObservabilityPanelProps {
   syntheticTasks?: readonly TraceTaskItem[];
   publishedShortsCount: number;
   runsCount: number;
-  onTriggerBudgetAction: (agentId: string, action: 'hit_80' | 'hit_100' | 'restore') => void;
+  currency: DisplayCurrency;
+  usdToBrlRate: number;
+  blockedAgentIds: Record<string, boolean>;
+  onToggleAgentTokenBlock: (agentId: string, block: boolean) => void;
 }
 
 export function OfficeObservabilityPanel({
@@ -47,7 +51,10 @@ export function OfficeObservabilityPanel({
   syntheticCalls,
   publishedShortsCount,
   runsCount,
-  onTriggerBudgetAction,
+  currency,
+  usdToBrlRate,
+  blockedAgentIds,
+  onToggleAgentTokenBlock,
 }: OfficeObservabilityPanelProps) {
   const [dbCalls, setDbCalls] = useState<LlmCallTelemetryRow[]>([]);
   const [dbPendingQueue, setDbPendingQueue] = useState(0);
@@ -94,10 +101,8 @@ export function OfficeObservabilityPanel({
     publishedShortsCount: effectiveShortsCount,
   });
 
-  async function handleBudgetButton(
-    agentId: string,
-    action: 'hit_80' | 'hit_100' | 'restore',
-  ) {
+  async function handleToggleBlockButton(agentId: string, shouldBlock: boolean) {
+    const action = shouldBlock ? 'block' : 'unblock';
     setBudgetSimLoadingId(`${agentId}_${action}`);
     try {
       if (officeId) {
@@ -108,7 +113,7 @@ export function OfficeObservabilityPanel({
         });
         await refreshObservabilityFromDb();
       }
-      onTriggerBudgetAction(agentId, action);
+      onToggleAgentTokenBlock(agentId, shouldBlock);
     } finally {
       setBudgetSimLoadingId(null);
     }
@@ -160,7 +165,10 @@ export function OfficeObservabilityPanel({
         <div className="border border-slate-800 bg-slate-950 p-3">
           <div className="text-[10px] uppercase text-slate-400">Custo Total (`llm_calls`)</div>
           <div className="mt-1 font-mono text-sm font-bold text-emerald-400">
-            ${officeSummary.totalCostUsd.toFixed(5)} USD
+            {formatMoneyFromUsd(officeSummary.totalCostUsd, currency, usdToBrlRate, {
+              decimals: currency === 'BRL' ? 4 : 5,
+              includeCode: true,
+            })}
           </div>
           <div className="mt-0.5 text-[10px] text-slate-400">
             {officeSummary.callsCount} chamadas registradas
@@ -170,7 +178,10 @@ export function OfficeObservabilityPanel({
         <div className="border border-slate-800 bg-slate-950 p-3">
           <div className="text-[10px] uppercase text-slate-400">Custo Médio / Run</div>
           <div className="mt-1 font-mono text-sm font-bold text-amber-300">
-            ${officeSummary.avgCostPerRunUsd.toFixed(5)} USD
+            {formatMoneyFromUsd(officeSummary.avgCostPerRunUsd, currency, usdToBrlRate, {
+              decimals: currency === 'BRL' ? 4 : 5,
+              includeCode: true,
+            })}
           </div>
           <div className="mt-0.5 text-[10px] text-slate-400">{effectiveRunsCount} runs</div>
         </div>
@@ -178,7 +189,10 @@ export function OfficeObservabilityPanel({
         <div className="border border-slate-800 bg-slate-950 p-3">
           <div className="text-[10px] uppercase text-slate-400">Custo / Short Publicado</div>
           <div className="mt-1 font-mono text-sm font-bold text-emerald-300">
-            ${officeSummary.costPerPublishedShortUsd.toFixed(5)} USD
+            {formatMoneyFromUsd(officeSummary.costPerPublishedShortUsd, currency, usdToBrlRate, {
+              decimals: currency === 'BRL' ? 4 : 5,
+              includeCode: true,
+            })}
           </div>
           <div className="mt-0.5 text-[10px] text-slate-400">
             {effectiveShortsCount} Shorts entregues
@@ -221,11 +235,14 @@ export function OfficeObservabilityPanel({
               ag.monthlyTokenBudget ?? 500_000,
             );
 
+            const isManuallyBlocked = Boolean(blockedAgentIds[ag.id]);
+            const isBlocked = isManuallyBlocked || budgetEval.status === 'exceeded_100';
+
             return (
               <div
                 key={ag.id}
                 className={`border-2 bg-slate-950 p-3.5 text-xs ${
-                  budgetEval.status === 'exceeded_100'
+                  isBlocked
                     ? 'border-red-500/90'
                     : budgetEval.status === 'warning_80'
                       ? 'border-amber-400/90'
@@ -239,9 +256,9 @@ export function OfficeObservabilityPanel({
                     </div>
                     <div className="font-bold text-white">{ag.name}</div>
                   </div>
-                  {budgetEval.status === 'exceeded_100' ? (
+                  {isBlocked ? (
                     <span className="border border-red-500 bg-red-950/80 px-2 py-0.5 text-[10px] font-bold uppercase text-red-200">
-                      💤 Pausado (100%)
+                      🔒 Bloqueado
                     </span>
                   ) : budgetEval.status === 'warning_80' ? (
                     <span className="border border-amber-400 bg-amber-950/80 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-200">
@@ -268,7 +285,7 @@ export function OfficeObservabilityPanel({
                   <div className="h-2 w-full bg-slate-800">
                     <div
                       className={`h-full transition-all ${
-                        budgetEval.status === 'exceeded_100'
+                        isBlocked
                           ? 'bg-red-500'
                           : budgetEval.status === 'warning_80'
                             ? 'bg-amber-400'
@@ -285,7 +302,9 @@ export function OfficeObservabilityPanel({
                   <div>
                     <div className="text-slate-500">Custo Acum.</div>
                     <div className="font-mono font-bold text-emerald-400">
-                      ${agMetrics.totalCostUsd.toFixed(4)}
+                      {formatMoneyFromUsd(agMetrics.totalCostUsd, currency, usdToBrlRate, {
+                        decimals: 4,
+                      })}
                     </div>
                   </div>
                   <div>
@@ -302,32 +321,31 @@ export function OfficeObservabilityPanel({
                   </div>
                 </div>
 
-                {/* Botoes para Simular / Testar Gatilhos de 80% e 100% */}
+                {/* Controle direto de bloqueio para impedir gasto de novos tokens */}
                 <div className="flex flex-wrap gap-1.5">
-                  <button
-                    type="button"
-                    disabled={budgetSimLoadingId !== null}
-                    onClick={() => handleBudgetButton(ag.id, 'hit_80')}
-                    className="border border-amber-500/70 bg-amber-950/40 px-2 py-1 text-[10px] font-bold uppercase text-amber-300 hover:border-amber-400"
-                  >
-                    ⚠️ Simular 80%
-                  </button>
-                  <button
-                    type="button"
-                    disabled={budgetSimLoadingId !== null}
-                    onClick={() => handleBudgetButton(ag.id, 'hit_100')}
-                    className="border border-red-500/80 bg-red-950/50 px-2 py-1 text-[10px] font-bold uppercase text-red-200 hover:border-red-400"
-                  >
-                    💤 Simular 100% (Pausar)
-                  </button>
-                  <button
-                    type="button"
-                    disabled={budgetSimLoadingId !== null}
-                    onClick={() => handleBudgetButton(ag.id, 'restore')}
-                    className="border border-emerald-500/70 bg-emerald-950/40 px-2 py-1 text-[10px] font-bold uppercase text-emerald-300 hover:border-emerald-400"
-                  >
-                    ↺ Liberar
-                  </button>
+                  {isBlocked ? (
+                    <button
+                      type="button"
+                      disabled={budgetSimLoadingId !== null}
+                      onClick={() => handleToggleBlockButton(ag.id, false)}
+                      className="w-full border border-emerald-500/80 bg-emerald-950/50 px-3 py-1.5 text-[10px] font-bold uppercase text-emerald-300 hover:border-emerald-400 disabled:opacity-50"
+                    >
+                      {budgetSimLoadingId === `${ag.id}_unblock`
+                        ? 'Desbloqueando...'
+                        : '🔓 Desbloquear Agente (Liberar Tokens)'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={budgetSimLoadingId !== null}
+                      onClick={() => handleToggleBlockButton(ag.id, true)}
+                      className="w-full border border-red-500/80 bg-red-950/50 px-3 py-1.5 text-[10px] font-bold uppercase text-red-200 hover:border-red-400 disabled:opacity-50"
+                    >
+                      {budgetSimLoadingId === `${ag.id}_block`
+                        ? 'Bloqueando...'
+                        : '🔒 Bloquear Gasto de Tokens'}
+                    </button>
+                  )}
                 </div>
               </div>
             );

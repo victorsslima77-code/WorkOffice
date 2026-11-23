@@ -184,7 +184,26 @@ export async function processQueuedAgentTask(
     throw new Error(`Agente ${task.agent_id} nao encontrado.`);
   }
 
-  // 1. Verifica orcamento mensal de tokens antes de chamar o LLM
+  // 1. Verifica bloqueio manual ou orcamento mensal de tokens ANTES de chamar o LLM
+  if (agent.status === 'paused_budget') {
+    await repo.updateTaskStatus(task.id, {
+      status: 'failed',
+      error_message:
+        'Agente bloqueado para não gastar mais tokens (paused_budget). Desbloqueie no painel de Observabilidade para retomar.',
+      finished_at: new Date().toISOString(),
+    });
+    await repo.insertAgentEvent({
+      office_id: agent.office_id,
+      agent_id: agent.id,
+      task_id: task.id,
+      type: 'budget.exceeded',
+      payload: {
+        message: `${agent.name} está bloqueado contra novos gastos de tokens e não executou a tarefa.`,
+      },
+    });
+    return { status: 'paused_budget', spawnedTaskIds: [] };
+  }
+
   if (agent.monthly_token_budget !== null && agent.monthly_token_budget > 0) {
     const usedTokens = await repo.getAgentMonthlyTokensUsed(agent.id);
     if (usedTokens >= agent.monthly_token_budget) {

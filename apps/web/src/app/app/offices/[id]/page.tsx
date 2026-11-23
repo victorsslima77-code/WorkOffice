@@ -17,6 +17,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { CharacterSpritePicker } from '@/components/character-preview';
 import { OfficeInteractiveStage } from '@/components/office-interactive-stage';
+import { OfficeLifecycleModal } from '@/components/office-lifecycle-modal';
 import { createSupabaseBrowserClient } from '@/lib/supabase/client';
 
 interface AgentRow {
@@ -72,6 +73,7 @@ export default function OfficeManagePage() {
   const [ytClientSecretInput, setYtClientSecretInput] = useState('');
   const [ytRefreshTokenInput, setYtRefreshTokenInput] = useState('');
   const [showYtVaultForm, setShowYtVaultForm] = useState(false);
+  const [showLifecycleModal, setShowLifecycleModal] = useState(false);
   const [connectingYt, setConnectingYt] = useState(false);
   const [loading, setLoading] = useState(true);
   const [savingAgentId, setSavingAgentId] = useState<string | null>(null);
@@ -270,7 +272,51 @@ export default function OfficeManagePage() {
 
   return (
     <main className="min-h-screen bg-slate-950 px-6 py-5">
+      <OfficeLifecycleModal
+        office={
+          showLifecycleModal && office
+            ? { id: office.id, name: office.name, status: office.status }
+            : null
+        }
+        onClose={() => setShowLifecycleModal(false)}
+        onStatusChanged={(_id, nextStatus) => {
+          setOffice((prev) => (prev ? { ...prev, status: nextStatus } : prev));
+          setAgents((prev) =>
+            prev.map((ag) => ({
+              ...ag,
+              status: nextStatus === 'paused' ? 'paused_budget' : 'idle',
+            })),
+          );
+          setStatusMsg(
+            nextStatus === 'paused'
+              ? 'Escritório inativado! Todos os agentes foram bloqueados contra gasto de tokens e o histórico foi preservado.'
+              : 'Escritório reativado! Os agentes estão liberados novamente.',
+          );
+        }}
+        onDeleted={() => {
+          router.push('/app');
+          router.refresh();
+        }}
+      />
+
       <div className="mx-auto max-w-[1600px]">
+        {office && office.status !== 'active' && (
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-2 border-red-500/80 bg-red-950/50 px-4 py-3 text-xs text-red-100">
+            <div>
+              <strong className="uppercase text-red-300">🔒 Escritório Inativo:</strong> Todos os
+              agentes estão bloqueados contra gastos de tokens. Todo o histórico permanece
+              disponível para consulta.
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowLifecycleModal(true)}
+              className="border border-emerald-400 bg-emerald-500 px-3 py-1 text-xs font-bold uppercase text-slate-950 hover:bg-emerald-400"
+            >
+              🔓 Reativar / Excluir
+            </button>
+          </div>
+        )}
+
         {statusMsg && (
           <div className="mb-3 border border-emerald-500 bg-emerald-950/60 p-3 text-xs text-emerald-200">
             {statusMsg}
@@ -290,7 +336,7 @@ export default function OfficeManagePage() {
           <div className="mb-6">
             <OfficeInteractiveStage
               officeId={officeId}
-              officeName={office?.name ?? 'Estúdio de Shorts'}
+              officeName={office?.name ?? 'Escritório'}
               subtitleBadge={
                 office?.office_templates?.name ?? 'Estúdio de Shorts para YouTube'
               }
@@ -313,10 +359,18 @@ export default function OfficeManagePage() {
                 <div className="flex items-center gap-2 border-l border-slate-700 pl-2">
                   <Link
                     href="/app/credentials"
-                    className="border border-emerald-500/70 bg-emerald-950/40 px-3 py-1.5 text-xs font-bold uppercase text-emerald-300 hover:border-emerald-400"
+                    className="inline-flex items-center gap-1.5 border border-emerald-500/70 bg-emerald-950/40 px-3 py-1.5 text-xs font-bold uppercase text-emerald-300 hover:border-emerald-400"
                   >
-                    Cofre (Vault)
+                    <span aria-hidden="true">🔐</span>
+                    <span>Cofre</span>
                   </Link>
+                  <button
+                    type="button"
+                    onClick={() => setShowLifecycleModal(true)}
+                    className="border border-red-500/70 bg-red-950/40 px-3 py-1.5 text-xs font-bold uppercase text-red-200 hover:border-red-400"
+                  >
+                    {office?.status !== 'active' ? '⚙️ Reativar / Excluir' : '🗑️ Inativar / Excluir'}
+                  </button>
                   <Link
                     href="/app"
                     className="border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-bold uppercase text-slate-200 hover:border-amber-400"

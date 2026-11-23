@@ -73,6 +73,27 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // Bloqueia novas execucoes se o escritorio estiver inativo (paused/archived)
+  const { data: officeRow } = await supabase
+    .from('offices')
+    .select('id, status')
+    .eq('id', officeId)
+    .maybeSingle();
+
+  if (!officeRow) {
+    return NextResponse.json({ error: 'Escritório não encontrado.' }, { status: 404 });
+  }
+
+  if (officeRow.status !== 'active') {
+    return NextResponse.json(
+      {
+        error:
+          'Este escritório está inativo e bloqueado contra gastos de tokens. Reative o escritório antes de iniciar novas atividades.',
+      },
+      { status: 403 },
+    );
+  }
+
   const { data, error } = await supabase.rpc('create_office_run', {
     p_office_id: officeId,
     p_instruction: instruction,

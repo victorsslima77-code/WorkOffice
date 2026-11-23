@@ -35,6 +35,12 @@ import {
   type TraceTaskItem,
 } from './office-observability-panel';
 import {
+  DEFAULT_USD_TO_BRL_RATE,
+  formatMoneyFromUsd,
+  type DisplayCurrency,
+  type ExchangeRateState,
+} from '@/lib/currency';
+import {
   reconstructInitialStatesFromEvents,
   useOfficeRealtimeStore,
   type PersistedAgentEventRow,
@@ -174,8 +180,63 @@ export function OfficeInteractiveStage({
   const [visualCommandLog, setVisualCommandLog] = useState<CanvasVisualCommand[]>([]);
   const [syntheticCalls, setSyntheticCalls] = useState<LlmCallTelemetryRow[]>([]);
   const [syntheticTasks, setSyntheticTasks] = useState<TraceTaskItem[]>([]);
-  const [pausedBudgetAgentIds, setPausedBudgetAgentIds] = useState<Record<string, boolean>>({});
+  const [pausedBudgetAgentIds, setPausedBudgetAgentIds] = useState<Record<string, boolean>>(() => {
+    const init: Record<string, boolean> = {};
+    for (const ag of agents) {
+      if (ag.status === 'paused_budget') {
+        init[ag.id] = true;
+      }
+    }
+    return init;
+  });
   const [runsCount, setRunsCount] = useState(1);
+  const [displayCurrency, setDisplayCurrency] = useState<DisplayCurrency>('USD');
+  const [exchangeRate, setExchangeRate] = useState<ExchangeRateState>({
+    rate: DEFAULT_USD_TO_BRL_RATE,
+    source: 'fallback',
+    referenceDate: '',
+  });
+
+  // Carrega preferencia de moeda e cotacao USD -> BRL do dia via BrasilAPI (/api/exchange-rate)
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const saved = window.localStorage.getItem('workoffice_display_currency');
+      if (saved === 'BRL' || saved === 'USD') {
+        setDisplayCurrency(saved);
+      }
+    }
+
+    let active = true;
+    fetch('/api/exchange-rate')
+      .then((res) => res.json())
+      .then((data: Partial<ExchangeRateState>) => {
+        if (!active) return;
+        if (typeof data.rate === 'number' && data.rate > 1) {
+          setExchangeRate({
+            rate: data.rate,
+            source: data.source ?? 'brasilapi',
+            referenceDate: data.referenceDate ?? '',
+          });
+        }
+      })
+      .catch(() => {
+        // Mantem taxa padrao caso offline
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  function handleToggleCurrency() {
+    setDisplayCurrency((prev) => {
+      const next: DisplayCurrency = prev === 'USD' ? 'BRL' : 'USD';
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem('workoffice_display_currency', next);
+      }
+      return next;
+    });
+  }
 
   // 1. Hidratacao inicial a partir do banco + Assinatura Supabase Realtime quando officeId esta presente
   useEffect(() => {
@@ -1144,20 +1205,16 @@ export function OfficeInteractiveStage({
     setIsReplayingHistory(true);
   }
 
-  function handleTriggerBudgetAction(
-    agentId: string,
-    action: 'hit_80' | 'hit_100' | 'restore',
-  ) {
+  function handleToggleAgentTokenBlock(agentId: string, shouldBlock: boolean) {
     const ag = agents.find((a) => a.id === agentId);
     if (!ag) return;
-    const budget = ag.monthlyTokenBudget ?? 500_000;
 
-    if (action === 'restore') {
-      setPausedBudgetAgentIds((prev) => ({ ...prev, [agentId]: false }));
-      setSyntheticCalls((prev) => prev.filter((c) => c.agent_id !== agentId));
+    setPausedBudgetAgentIds((prev) => ({ ...prev, [agentId]: shouldBlock }));
+
+    if (!shouldBlock) {
       const restoredState: ActiveAgentVisualState = {
         eventType: 'agent.idle',
-        message: `Orçamento de ${ag.name} restaurado! Pronto para novas tarefas.`,
+        message: `Bloqueio de tokens removido para ${ag.name}! Pronto para novas tarefas.`,
       };
       setActiveStates((prev) => ({
         ...prev,
@@ -1166,67 +1223,54 @@ export function OfficeInteractiveStage({
       setVisualCommandLog((prev) => [
         ...prev.slice(-199),
         {
-          commandId: `budget_restore_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          commandId: `budget_unblock_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           agentId,
           ...restoredState,
         },
       ]);
-      return;
-    }
-
-    const targetTokens = action === 'hit_80' ? Math.round(budget * 0.85) : budget + 5000;
-    const taskId = `task_budget_${action}_${Date.now()}`;
-
-    setSyntheticCalls((prev) => [
-      {
-        id: `call_budget_${Date.now()}`,
-        task_id: taskId,
-        agent_id: ag.id,
-        provider: ag.provider,
-        model: ag.model,
-        effort: ag.effort,
-        input_tokens: Math.round(targetTokens * 0.6),
-        output_tokens: Math.round(targetTokens * 0.4),
-        reasoning_tokens: 0,
-        cost_usd: Number(((targetTokens / 1_000_000) * 4.2).toFixed(5)),
-        latency_ms: 790,
-        error: null,
-        created_at: new Date().toISOString(),
-      },
-      ...prev.filter((c) => c.agent_id !== agentId),
-    ]);
-
-    if (action === 'hit_100') {
-      setPausedBudgetAgentIds((prev) => ({ ...prev, [agentId]: true }));
-      const exceededState: ActiveAgentVisualState = {
-        eventType: 'budget.exceeded',
-        message: `100% do orçamento mensal atingido (${budget.toLocaleString()} tok)! ${ag.name} teve novas tasks bloqueadas e foi pausado na copa (💤).`,
-      };
-      setActiveStates((prev) => ({
-        ...prev,
-        [agentId]: exceededState,
-      }));
-      setVisualCommandLog((prev) => [
-        ...prev.slice(-199),
-        {
-          commandId: `budget_100_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          agentId,
-          ...exceededState,
-        },
-      ]);
       setFeed((prev) => [
         {
-          id: `budget_${Date.now()}`,
+          id: `unblock_${Date.now()}`,
           timestamp: new Date().toLocaleTimeString('pt-BR'),
           agentId: ag.id,
           agentName: ag.name,
           roleName: ag.roleName,
-          type: 'budget.exceeded',
-          message: `ALERTA 100%: ${ag.name} atingiu o teto de tokens e foi movido para a copa com ícone de pausa (💤).`,
+          type: 'agent.idle',
+          message: `🔓 ${ag.name} foi desbloqueado e voltou a poder consumir tokens.`,
         },
         ...prev,
       ]);
+      return;
     }
+
+    const blockedState: ActiveAgentVisualState = {
+      eventType: 'budget.exceeded',
+      message: `🔒 Gasto de tokens bloqueado pelo usuário! ${ag.name} foi pausado na copa e não consumirá mais tokens.`,
+    };
+    setActiveStates((prev) => ({
+      ...prev,
+      [agentId]: blockedState,
+    }));
+    setVisualCommandLog((prev) => [
+      ...prev.slice(-199),
+      {
+        commandId: `budget_block_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        agentId,
+        ...blockedState,
+      },
+    ]);
+    setFeed((prev) => [
+      {
+        id: `block_${Date.now()}`,
+        timestamp: new Date().toLocaleTimeString('pt-BR'),
+        agentId: ag.id,
+        agentName: ag.name,
+        roleName: ag.roleName,
+        type: 'budget.exceeded',
+        message: `🔒 ${ag.name} foi bloqueado para não gastar mais tokens e pausado na copa.`,
+      },
+      ...prev,
+    ]);
   }
 
   const workingCount = Object.values(activeStates).filter(
@@ -1722,7 +1766,13 @@ export function OfficeInteractiveStage({
                                 {call.provider}/{call.model} ({call.effort})
                               </span>
                               <span>
-                                ${Number(call.cost_usd).toFixed(5)} USD • {call.latency_ms}ms
+                                {formatMoneyFromUsd(
+                                  Number(call.cost_usd),
+                                  displayCurrency,
+                                  exchangeRate.rate,
+                                  { decimals: displayCurrency === 'BRL' ? 4 : 5, includeCode: true },
+                                )}{' '}
+                                • {call.latency_ms}ms
                               </span>
                             </div>
                             <div className="mt-1 text-slate-400">
@@ -1843,7 +1893,12 @@ export function OfficeInteractiveStage({
             </div>
             <div className="border border-slate-800 bg-slate-950 px-3 py-1.5">
               <div className="text-[10px] uppercase text-slate-400">Custo Escritório (Dia)</div>
-              <div className="font-bold text-emerald-400">${officeDailyCostUsd.toFixed(4)} USD</div>
+              <div className="font-bold text-emerald-400">
+                {formatMoneyFromUsd(officeDailyCostUsd, displayCurrency, exchangeRate.rate, {
+                  decimals: 4,
+                  includeCode: true,
+                })}
+              </div>
             </div>
             <div className="border border-slate-800 bg-slate-950 px-3 py-1.5">
               <div className="text-[10px] uppercase text-slate-400">Tokens no Dia</div>
@@ -1855,22 +1910,44 @@ export function OfficeInteractiveStage({
             </div>
           </div>
 
-          {headerActions ?? (
-            <div className="flex items-center gap-2">
-              <Link
-                href="/app/new-office"
-                className="border border-amber-400/80 bg-amber-950/40 px-3 py-1.5 text-xs font-bold uppercase text-amber-300 hover:border-amber-400"
-              >
-                + Novo Escritório
-              </Link>
-              <Link
-                href="/app"
-                className="border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-bold uppercase text-slate-200 hover:border-amber-400"
-              >
-                ← Painel
-              </Link>
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleToggleCurrency}
+              title={`Alternar moeda de exibição (Cotação do dia: 1 USD = R$ ${exchangeRate.rate.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 4 })} • ${exchangeRate.source === 'brasilapi' ? 'BrasilAPI PTAX' : exchangeRate.source}${exchangeRate.referenceDate ? ` • ${exchangeRate.referenceDate}` : ''})`}
+              className={`inline-flex items-center gap-1.5 border px-2.5 py-1.5 text-xs font-bold uppercase transition-colors ${
+                displayCurrency === 'BRL'
+                  ? 'border-emerald-400 bg-emerald-950/60 text-emerald-300 hover:bg-emerald-900/60'
+                  : 'border-amber-400/80 bg-amber-950/40 text-amber-300 hover:bg-amber-900/50'
+              }`}
+            >
+              <span>{displayCurrency === 'BRL' ? '🇧🇷 R$ BRL' : '💵 $ USD'}</span>
+              <span className="border-l border-current/30 pl-1.5 font-mono text-[10px] opacity-85">
+                1 USD = R${' '}
+                {exchangeRate.rate.toLocaleString('pt-BR', {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
+              </span>
+            </button>
+
+            {headerActions ?? (
+              <div className="flex items-center gap-2">
+                <Link
+                  href="/app/new-office"
+                  className="border border-amber-400/80 bg-amber-950/40 px-3 py-1.5 text-xs font-bold uppercase text-amber-300 hover:border-amber-400"
+                >
+                  + Novo Escritório
+                </Link>
+                <Link
+                  href="/app"
+                  className="border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs font-bold uppercase text-slate-200 hover:border-amber-400"
+                >
+                  ← Painel
+                </Link>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Barra de Comandos do Escritorio */}
@@ -1896,41 +1973,42 @@ export function OfficeInteractiveStage({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                const nextClean =
-                  instructionInput.trim() ||
-                  activeInstruction.trim() ||
-                  'Crie 3 vídeos sobre o tema solicitado';
-                if (nextClean !== activeInstruction) {
-                  setActiveInstruction(nextClean);
-                }
-                if (!isPlaying && currentStepIdx >= scenarioSteps.length - 1) {
-                  handleResetSimulation();
-                }
-                if (!isPlaying && currentStepIdx === -1) {
-                  if (officeId) {
-                    void handleDispatchInstructionToScriptwriter();
-                    return;
-                  }
-                  advanceScenarioStep(0);
-                }
-                setIsPlaying((prev) => !prev);
-              }}
-              className="border-2 border-amber-400 bg-amber-500 px-3.5 py-1.5 text-xs font-bold uppercase text-slate-950 hover:bg-amber-400"
-            >
-              {isPlaying ? '⏸ Pausar' : '▶ Simular Simultâneo'}
-            </button>
+            {/* Opcoes exclusivas do modo simulacao (/app/simulator); ocultas em escritorios reais */}
+            {!officeId && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextClean =
+                      instructionInput.trim() ||
+                      activeInstruction.trim() ||
+                      'Crie 3 vídeos sobre o tema solicitado';
+                    if (nextClean !== activeInstruction) {
+                      setActiveInstruction(nextClean);
+                    }
+                    if (!isPlaying && currentStepIdx >= scenarioSteps.length - 1) {
+                      handleResetSimulation();
+                    }
+                    if (!isPlaying && currentStepIdx === -1) {
+                      advanceScenarioStep(0);
+                    }
+                    setIsPlaying((prev) => !prev);
+                  }}
+                  className="border-2 border-amber-400 bg-amber-500 px-3.5 py-1.5 text-xs font-bold uppercase text-slate-950 hover:bg-amber-400"
+                >
+                  {isPlaying ? '⏸ Pausar' : '▶ Simular Simultâneo'}
+                </button>
 
-            <button
-              type="button"
-              disabled={isPlaying || currentStepIdx >= scenarioSteps.length - 1}
-              onClick={() => advanceScenarioStep(currentStepIdx + 1)}
-              className="border border-emerald-400 bg-emerald-950/60 px-3 py-1.5 text-xs font-bold uppercase text-emerald-300 hover:bg-emerald-900/60 disabled:opacity-40"
-            >
-              ⏭ Onda ({Math.max(0, currentStepIdx + 1)}/{scenarioSteps.length})
-            </button>
+                <button
+                  type="button"
+                  disabled={isPlaying || currentStepIdx >= scenarioSteps.length - 1}
+                  onClick={() => advanceScenarioStep(currentStepIdx + 1)}
+                  className="border border-emerald-400 bg-emerald-950/60 px-3 py-1.5 text-xs font-bold uppercase text-emerald-300 hover:bg-emerald-900/60 disabled:opacity-40"
+                >
+                  ⏭ Onda ({Math.max(0, currentStepIdx + 1)}/{scenarioSteps.length})
+                </button>
+              </>
+            )}
 
             {replayHistory.length > 0 && (
               <button
@@ -1951,13 +2029,15 @@ export function OfficeInteractiveStage({
               🛑 Descansar Todos
             </button>
 
-            <button
-              type="button"
-              onClick={handleResetSimulation}
-              className="border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-xs font-bold uppercase text-slate-200 hover:border-amber-400"
-            >
-              ↺ Reiniciar
-            </button>
+            {!officeId && (
+              <button
+                type="button"
+                onClick={handleResetSimulation}
+                className="border border-slate-600 bg-slate-800 px-2.5 py-1.5 text-xs font-bold uppercase text-slate-200 hover:border-amber-400"
+              >
+                ↺ Reiniciar
+              </button>
+            )}
 
             <div className="flex items-center gap-1 border-l border-slate-700 pl-2">
               {([1, 2, 4] as const).map((spd) => (
@@ -2057,19 +2137,34 @@ export function OfficeInteractiveStage({
                 <div className="border border-slate-800 bg-slate-950 p-2">
                   <div className="text-[9px] uppercase text-slate-400">Última Tarefa</div>
                   <div className="mt-0.5 font-mono text-xs font-bold text-white">
-                    ${selectedCostStats.lastTaskCostUsd.toFixed(4)}
+                    {formatMoneyFromUsd(
+                      selectedCostStats.lastTaskCostUsd,
+                      displayCurrency,
+                      exchangeRate.rate,
+                      { decimals: 4 },
+                    )}
                   </div>
                 </div>
                 <div className="border border-slate-800 bg-slate-950 p-2">
                   <div className="text-[9px] uppercase text-slate-400">Média / Tarefa</div>
                   <div className="mt-0.5 font-mono text-xs font-bold text-amber-300">
-                    ${selectedAvgTaskCostUsd.toFixed(4)}
+                    {formatMoneyFromUsd(
+                      selectedAvgTaskCostUsd,
+                      displayCurrency,
+                      exchangeRate.rate,
+                      { decimals: 4 },
+                    )}
                   </div>
                 </div>
                 <div className="border border-slate-800 bg-slate-950 p-2">
                   <div className="text-[9px] uppercase text-slate-400">Custo no Dia</div>
                   <div className="mt-0.5 font-mono text-xs font-bold text-emerald-400">
-                    ${selectedCostStats.dailyCostUsd.toFixed(4)}
+                    {formatMoneyFromUsd(
+                      selectedCostStats.dailyCostUsd,
+                      displayCurrency,
+                      exchangeRate.rate,
+                      { decimals: 4 },
+                    )}
                   </div>
                 </div>
               </div>
@@ -2271,7 +2366,10 @@ export function OfficeInteractiveStage({
         syntheticTasks={syntheticTasks}
         publishedShortsCount={Math.max(1, officeArtifactsCount)}
         runsCount={runsCount}
-        onTriggerBudgetAction={handleTriggerBudgetAction}
+        currency={displayCurrency}
+        usdToBrlRate={exchangeRate.rate}
+        blockedAgentIds={pausedBudgetAgentIds}
+        onToggleAgentTokenBlock={handleToggleAgentTokenBlock}
       />
     </section>
   );

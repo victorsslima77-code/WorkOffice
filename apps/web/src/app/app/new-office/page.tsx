@@ -79,10 +79,17 @@ const INITIAL_SLOTS: SlotDraftState[] = [
 
 export default function NewOfficeWizardPage() {
   const router = useRouter();
-  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [officeName, setOfficeName] = useState('');
   const [slots, setSlots] = useState<SlotDraftState[]>(INITIAL_SLOTS);
   const [credentials, setCredentials] = useState<MaskedCredential[]>([]);
+
+  // Passo 3 (Especifico do template Estúdio de Shorts para YouTube): Credenciais OAuth do Google/YouTube
+  const [ytChannelId, setYtChannelId] = useState('');
+  const [ytChannelTitle, setYtChannelTitle] = useState('');
+  const [ytClientId, setYtClientId] = useState('');
+  const [ytClientSecret, setYtClientSecret] = useState('');
+  const [ytRefreshToken, setYtRefreshToken] = useState('');
 
   // Modal inline para cadastrar chave rapidamente sem sair do wizard
   const [quickCredProvider, setQuickCredProvider] = useState<LlmProvider>('anthropic');
@@ -292,6 +299,37 @@ export default function NewOfficeWizardPage() {
         return;
       }
 
+      // Se o usuario informou os dados OAuth do Google/YouTube no Passo 3, criptografa e salva no Vault do escritorio
+      const hasOAuthCredentials =
+        ytChannelId.trim().length > 0 &&
+        ytClientId.trim().length > 0 &&
+        ytClientSecret.trim().length > 0 &&
+        ytRefreshToken.trim().length >= 8;
+
+      if (hasOAuthCredentials) {
+        const ytRes = await fetch('/api/integrations/youtube', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            officeId: createdOffice.id,
+            channelId: ytChannelId.trim(),
+            channelTitle: ytChannelTitle.trim() || ytChannelId.trim(),
+            clientId: ytClientId.trim(),
+            clientSecret: ytClientSecret.trim(),
+            refreshToken: ytRefreshToken.trim(),
+          }),
+        });
+        if (!ytRes.ok) {
+          const ytData = await ytRes.json().catch(() => ({}));
+          setErrorMsg(
+            `Escritório criado, mas houve um erro ao salvar o OAuth do YouTube: ${ytData.error ?? 'verifique os campos OAuth na tela do escritório.'}`,
+          );
+          router.push(`/app/offices/${createdOffice.id}`);
+          router.refresh();
+          return;
+        }
+      }
+
       router.push(`/app/offices/${createdOffice.id}`);
       router.refresh();
     } catch (err) {
@@ -307,10 +345,10 @@ export default function NewOfficeWizardPage() {
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4 border-2 border-slate-700 bg-slate-900 px-6 py-4">
           <div>
             <span className="text-xs uppercase tracking-widest text-amber-400">
-              Wizard de Fundação // Passo {step} de 3
+              Wizard de Fundação // Passo {step} de 4
             </span>
             <h1 className="text-2xl font-bold text-white">
-              Criar Novo Escritório & Contratar Agentes
+              Criar Novo Escritório &amp; Contratar Agentes
             </h1>
           </div>
           <div className="flex gap-3">
@@ -318,7 +356,7 @@ export default function NewOfficeWizardPage() {
               href="/app/credentials"
               className="border border-emerald-500/70 bg-emerald-950/40 px-3 py-1.5 text-xs font-bold uppercase text-emerald-300 hover:border-emerald-400"
             >
-              Cofre de Chaves ({credentials.length})
+              🔐 Cofre ({credentials.length})
             </Link>
             <Link
               href="/app"
@@ -329,8 +367,8 @@ export default function NewOfficeWizardPage() {
           </div>
         </header>
 
-        {/* Barra de Etapas */}
-        <div className="mb-6 grid grid-cols-3 gap-3 text-xs font-bold uppercase">
+        {/* Barra de Etapas (4 passos para o template Estúdio de Shorts para YouTube) */}
+        <div className="mb-6 grid grid-cols-2 gap-3 text-xs font-bold uppercase lg:grid-cols-4">
           <button
             type="button"
             onClick={() => setStep(1)}
@@ -340,7 +378,7 @@ export default function NewOfficeWizardPage() {
                 : 'border-slate-800 bg-slate-900 text-slate-400'
             }`}
           >
-            1. Modelo & Nome do Escritório
+            1. Modelo &amp; Nome
           </button>
           <button
             type="button"
@@ -354,7 +392,7 @@ export default function NewOfficeWizardPage() {
                 : 'border-slate-800 bg-slate-900 text-slate-400'
             }`}
           >
-            2. Contratar Agentes (Baias 1 a 3)
+            2. Contratar Agentes
           </button>
           <button
             type="button"
@@ -368,7 +406,21 @@ export default function NewOfficeWizardPage() {
                 : 'border-slate-800 bg-slate-900 text-slate-400'
             }`}
           >
-            3. Estimativa de Custo & Confirmação
+            3. Google OAuth (YouTube)
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (officeName.trim().length >= 3) setStep(4);
+              else setErrorMsg('Informe um nome com pelo menos 3 caracteres para o escritório.');
+            }}
+            className={`border-2 p-3 text-left ${
+              step === 4
+                ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                : 'border-slate-800 bg-slate-900 text-slate-400'
+            }`}
+          >
+            4. Revisão &amp; Confirmação
           </button>
         </div>
 
@@ -740,17 +792,161 @@ export default function NewOfficeWizardPage() {
                 onClick={() => setStep(3)}
                 className="border-2 border-amber-400 bg-amber-500 px-6 py-2.5 text-xs font-bold uppercase text-slate-950 hover:bg-amber-400"
               >
-                Revisar Contratação →
+                Configurar OAuth do YouTube →
               </button>
             </div>
           </section>
         )}
 
-        {/* PASSO 3: REVISAO E CONFIRMACAO */}
+        {/* PASSO 3: GOOGLE OAUTH DA CONTA DO YOUTUBE QUE RECEBERA OS SHORTS */}
         {step === 3 && (
           <section className="border-2 border-amber-500/80 bg-slate-900 p-6">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-4 border-b border-slate-800 pb-4">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-widest text-amber-400">
+                  Template: Estúdio de Shorts para YouTube // Integração de Canal
+                </span>
+                <h2 className="mt-1 text-lg font-bold text-white">
+                  Passo 3 — Credenciais Google OAuth do Canal de Destino
+                </h2>
+                <p className="mt-1 max-w-2xl text-xs leading-relaxed text-slate-300">
+                  Informe os dados OAuth 2.0 da conta Google/YouTube que receberá os Shorts
+                  publicados pelo agente Publicador. Todas as chaves serão criptografadas e
+                  encapsuladas exclusivamente no seu Cofre (Supabase Vault).
+                </p>
+              </div>
+              <span className="border border-emerald-500/60 bg-emerald-950/50 px-2.5 py-1 text-[10px] font-bold uppercase text-emerald-300">
+                🔒 Criptografado no Cofre
+              </span>
+            </div>
+
+            <div className="mb-6 grid gap-4 text-xs sm:grid-cols-2">
+              <div>
+                <label className="mb-1 block font-bold uppercase text-slate-300">
+                  Channel ID do YouTube
+                </label>
+                <input
+                  type="text"
+                  value={ytChannelId}
+                  onChange={(e) => setYtChannelId(e.target.value)}
+                  placeholder="Ex: UC_xYz1234567890..."
+                  className="w-full border border-slate-700 bg-slate-950 px-3 py-2 text-white focus:border-amber-400 focus:outline-none"
+                />
+                <p className="mt-1 text-[10px] text-slate-500">
+                  Encontre em YouTube Studio → Personalização → Informações básicas ou Configurações
+                  avançadas.
+                </p>
+              </div>
+
+              <div>
+                <label className="mb-1 block font-bold uppercase text-slate-300">
+                  Nome do Canal (Identificação)
+                </label>
+                <input
+                  type="text"
+                  value={ytChannelTitle}
+                  onChange={(e) => setYtChannelTitle(e.target.value)}
+                  placeholder="Ex: Meu Canal de Cortes"
+                  className="w-full border border-slate-700 bg-slate-950 px-3 py-2 text-white focus:border-amber-400 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block font-bold uppercase text-slate-300">
+                  Google OAuth Client ID
+                </label>
+                <input
+                  type="text"
+                  value={ytClientId}
+                  onChange={(e) => setYtClientId(e.target.value)}
+                  placeholder="Ex: 123456789-xxxx.apps.googleusercontent.com"
+                  className="w-full border border-slate-700 bg-slate-950 px-3 py-2 text-white focus:border-amber-400 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block font-bold uppercase text-slate-300">
+                  Google OAuth Client Secret
+                </label>
+                <input
+                  type="password"
+                  value={ytClientSecret}
+                  onChange={(e) => setYtClientSecret(e.target.value)}
+                  placeholder="Ex: GOCSPX-..."
+                  className="w-full border border-slate-700 bg-slate-950 px-3 py-2 text-white focus:border-amber-400 focus:outline-none"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="mb-1 block font-bold uppercase text-slate-300">
+                  OAuth Refresh Token (Escopos: youtube.upload + yt-analytics.readonly)
+                </label>
+                <input
+                  type="password"
+                  value={ytRefreshToken}
+                  onChange={(e) => setYtRefreshToken(e.target.value)}
+                  placeholder="Ex: 1//0g..."
+                  className="w-full border border-slate-700 bg-slate-950 px-3 py-2 text-white focus:border-amber-400 focus:outline-none"
+                />
+                <p className="mt-1 text-[10px] text-slate-400">
+                  Gerado via Google OAuth Playground com o seu Client ID/Secret próprio (cota
+                  isolada de 10.000 unidades/dia = até 6 Shorts/dia).
+                </p>
+              </div>
+            </div>
+
+            <div className="mb-6 border border-slate-800 bg-slate-950 p-3 text-[11px] text-slate-300">
+              <strong className="text-amber-300">Opcional nesta etapa:</strong> você pode preencher
+              agora para o escritório já nascer pronto para publicar no YouTube, ou deixar em branco
+              e configurar/rotacionar depois dentro do painel do escritório.
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <button
+                type="button"
+                onClick={() => setStep(2)}
+                className="border border-slate-600 bg-slate-800 px-5 py-2.5 text-xs font-bold uppercase text-slate-200"
+              >
+                ← Voltar aos Agentes
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const anyFilled =
+                    ytChannelId.trim() ||
+                    ytClientId.trim() ||
+                    ytClientSecret.trim() ||
+                    ytRefreshToken.trim();
+                  const allFilled =
+                    ytChannelId.trim() &&
+                    ytClientId.trim() &&
+                    ytClientSecret.trim() &&
+                    ytRefreshToken.trim().length >= 8;
+
+                  if (anyFilled && !allFilled) {
+                    setErrorMsg(
+                      'Preencha Channel ID, Client ID, Client Secret e Refresh Token completos (ou deixe todos vazios para configurar depois).',
+                    );
+                    return;
+                  }
+                  setErrorMsg(null);
+                  setStep(4);
+                }}
+                className="border-2 border-amber-400 bg-amber-500 px-6 py-2.5 text-xs font-bold uppercase text-slate-950 hover:bg-amber-400"
+              >
+                {ytRefreshToken.trim().length >= 8
+                  ? 'Revisar Contratação →'
+                  : 'Pular / Revisar Contratação →'}
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* PASSO 4: REVISAO E CONFIRMACAO */}
+        {step === 4 && (
+          <section className="border-2 border-amber-500/80 bg-slate-900 p-6">
             <h2 className="mb-2 text-lg font-bold text-white">
-              Passo 3 — Revisão Final e Estimativa de Custos
+              Passo 4 — Revisão Final e Estimativa de Custos
             </h2>
             <p className="mb-6 text-xs text-slate-300">
               Confira o quadro de funcionários de IA do escritório{' '}
@@ -835,13 +1031,51 @@ export default function NewOfficeWizardPage() {
               </div>
             </div>
 
+            <div className="mb-6 border border-slate-800 bg-slate-950 p-4 text-xs">
+              <div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-amber-400">
+                Integração Google OAuth (YouTube Shorts)
+              </div>
+              {ytChannelId.trim() && ytRefreshToken.trim().length >= 8 ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 text-emerald-300">
+                  <span>
+                    ✅ Canal configurado:{' '}
+                    <strong className="text-white">
+                      {ytChannelTitle.trim() || ytChannelId.trim()}
+                    </strong>{' '}
+                    (<code>{ytChannelId.trim()}</code>) — será criptografado no Cofre ao inaugurar.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setStep(3)}
+                    className="border border-slate-700 bg-slate-900 px-2.5 py-1 text-[10px] font-bold uppercase text-slate-200 hover:border-amber-400"
+                  >
+                    Editar OAuth
+                  </button>
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center justify-between gap-2 text-slate-400">
+                  <span>
+                    ⚠️ Credenciais OAuth do YouTube ainda não informadas (você poderá configurar
+                    depois dentro do escritório).
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setStep(3)}
+                    className="border border-amber-500/60 bg-amber-950/40 px-2.5 py-1 text-[10px] font-bold uppercase text-amber-300 hover:border-amber-400"
+                  >
+                    Configurar Agora
+                  </button>
+                </div>
+              )}
+            </div>
+
             <div className="flex items-center justify-between">
               <button
                 type="button"
-                onClick={() => setStep(2)}
+                onClick={() => setStep(3)}
                 className="border border-slate-600 bg-slate-800 px-5 py-2.5 text-xs font-bold uppercase text-slate-200"
               >
-                ← Ajustar Agentes
+                ← Voltar ao OAuth YouTube
               </button>
               <button
                 type="button"
