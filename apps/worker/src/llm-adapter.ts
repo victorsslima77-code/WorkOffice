@@ -130,12 +130,19 @@ function extractErrorStatusAndMessage(err: unknown): { status?: number; message:
     status?: number;
     responseBody?: string;
     message?: string;
-    cause?: { statusCode?: number; status?: number; message?: string };
+    lastError?: { statusCode?: number; status?: number; responseBody?: string; message?: string };
+    cause?: { statusCode?: number; status?: number; responseBody?: string; message?: string };
   };
-  const status = e?.statusCode ?? e?.status ?? e?.cause?.statusCode ?? e?.cause?.status;
-  const rawMsg = e?.responseBody
-    ? `${e.message ?? 'Erro LLM'} | ${String(e.responseBody).slice(0, 320)}`
-    : (e?.message ?? String(err));
+  const status =
+    e?.statusCode ??
+    e?.status ??
+    e?.lastError?.statusCode ??
+    e?.lastError?.status ??
+    e?.cause?.statusCode ??
+    e?.cause?.status;
+  const body = e?.responseBody ?? e?.lastError?.responseBody ?? e?.cause?.responseBody;
+  const baseMsg = e?.lastError?.message ?? e?.message ?? String(err);
+  const rawMsg = body ? `${baseMsg} | ${String(body).slice(0, 320)}` : baseMsg;
   return { status, message: rawMsg };
 }
 
@@ -208,6 +215,109 @@ export async function discoverActiveGoogleGeminiModel(
     };
 
     const ranked = [...availableModels].sort((a, b) => scoreModel(b) - scoreModel(a));
+    const best = ranked.find((id) => id !== requestedModel) ?? ranked[0] ?? null;
+    return { selectedModel: best, availableModels };
+  } catch {
+    return { selectedModel: null, availableModels: [] };
+  }
+}
+
+/**
+ * Consulta GET /v1/models na Anthropic usando a propria chave do agente para recuperar
+ * automaticamente de HTTP 404 (ex: modelos aposentados como claude-3-5-haiku-latest).
+ */
+export async function discoverActiveAnthropicModel(
+  apiKey: string,
+  requestedModel: string,
+): Promise<{ selectedModel: string | null; availableModels: string[] }> {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/models', {
+      method: 'GET',
+      headers: {
+        'x-api-key': apiKey.trim(),
+        'anthropic-version': '2023-06-01',
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) {
+      return { selectedModel: null, availableModels: [] };
+    }
+
+    const data = (await res.json()) as {
+      data?: { id?: string }[];
+    };
+
+    const availableModels = (data.data ?? [])
+      .map((m) => String(m.id ?? '').trim())
+      .filter((id) => id.startsWith('claude-'));
+
+    if (availableModels.length === 0) {
+      return { selectedModel: null, availableModels: [] };
+    }
+
+    const reqLower = requestedModel.toLowerCase();
+    const wantsHaiku = reqLower.includes('haiku');
+    const wantsOpus = reqLower.includes('opus');
+    const wantsSonnet = reqLower.includes('sonnet');
+
+    const scoreModel = (id: string): number => {
+      const lower = id.toLowerCase();
+      let score = 0;
+      if (lower === reqLower) score -= 1000;
+      if (wantsHaiku && lower.includes('haiku')) score += 50;
+      if (wantsSonnet && lower.includes('sonnet')) score += 50;
+      if (wantsOpus && lower.includes('opus')) score += 50;
+      if (lower.includes('4-5') || lower.includes('4.5')) score += 30;
+      if (lower.includes('4-6') || lower.includes('4.6')) score += 35;
+      if (lower.includes('-4-')) score += 20;
+      return score;
+    };
+
+    const ranked = [...availableModels].sort((a, b) => scoreModel(b) - scoreModel(a));
+    const best = ranked.find((id) => id !== requestedModel) ?? ranked[0] ?? null;
+    return { selectedModel: best, availableModels };
+  } catch {
+    return { selectedModel: null, availableModels: [] };
+  }
+}
+
+/**
+ * Consulta GET /v1/models na OpenAI para recuperar automaticamente de HTTP 404.
+ */
+export async function discoverActiveOpenAiModel(
+  apiKey: string,
+  requestedModel: string,
+): Promise<{ selectedModel: string | null; availableModels: string[] }> {
+  try {
+    const res = await fetch('https://api.openai.com/v1/models', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey.trim()}`,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) {
+      return { selectedModel: null, availableModels: [] };
+    }
+
+    const data = (await res.json()) as { data?: { id?: string }[] };
+    const availableModels = (data.data ?? [])
+      .map((m) => String(m.id ?? '').trim())
+      .filter((id) => /^gpt-(?:4\.1|4o|5)/.test(id) && !/audio|realtime|image|tts|transcribe/i.test(id));
+
+    if (availableModels.length === 0) {
+      return { selectedModel: null, availableModels: [] };
+    }
+
+    const wantsMini = requestedModel.toLowerCase().includes('mini');
+    const ranked = [...availableModels].sort((a, b) => {
+      const aMini = a.includes('mini') ? 1 : 0;
+      const bMini = b.includes('mini') ? 1 : 0;
+      if (wantsMini && aMini !== bMini) return bMini - aMini;
+      return b.localeCompare(a);
+    });
     const best = ranked.find((id) => id !== requestedModel) ?? ranked[0] ?? null;
     return { selectedModel: best, availableModels };
   } catch {
@@ -394,8 +504,62 @@ export async function runRoleWithMultiProviderLlm(
         throw new Error('Chamada LLM cancelada pelo usuário.');
       }
 
-      // Auto-recuperacao para Google Gemini 404 (modelo depreciado/indisponivel na chave ou chave AQ. Express Mode)
-      if (req.provider === 'google' && isNotFound404Error(firstErr)) {
+      // Auto-recuperacao para Anthropic Claude 404 (ex: claude-3-5-haiku-latest aposentado em 2026)
+      if (req.provider === 'anthropic' && isNotFound404Error(firstErr)) {
+        const discovery = await discoverActiveAnthropicModel(req.apiKey, resolvedModel);
+        if (discovery.selectedModel) {
+          resolvedModel = discovery.selectedModel;
+          await ctx.emitVisualEvent({
+            type: 'llm.thinking',
+            message: `Modelo ${req.model} retornou 404 na Anthropic; usando modelo ativo "${resolvedModel}".`,
+          });
+          try {
+            const retryRes = await invokeAiSdk(resolvedModel, false);
+            rawText = retryRes.text.trim();
+            if (retryRes.usage) {
+              inputTokens = retryRes.usage.promptTokens || inputTokens;
+              outputTokens = retryRes.usage.completionTokens || outputTokens;
+            }
+          } catch (retryErr) {
+            const detail = extractErrorStatusAndMessage(retryErr);
+            throw new Error(
+              `Anthropic falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
+            );
+          }
+        } else {
+          const detail = extractErrorStatusAndMessage(firstErr);
+          throw new Error(
+            `Anthropic retornou HTTP 404 para "${req.model}" e nenhum modelo Claude ativo foi encontrado nessa chave (${detail.message}).`,
+          );
+        }
+      } else if (req.provider === 'openai' && isNotFound404Error(firstErr)) {
+        const discovery = await discoverActiveOpenAiModel(req.apiKey, resolvedModel);
+        if (discovery.selectedModel) {
+          resolvedModel = discovery.selectedModel;
+          await ctx.emitVisualEvent({
+            type: 'llm.thinking',
+            message: `Modelo ${req.model} retornou 404 na OpenAI; usando modelo ativo "${resolvedModel}".`,
+          });
+          try {
+            const retryRes = await invokeAiSdk(resolvedModel, false);
+            rawText = retryRes.text.trim();
+            if (retryRes.usage) {
+              inputTokens = retryRes.usage.promptTokens || inputTokens;
+              outputTokens = retryRes.usage.completionTokens || outputTokens;
+            }
+          } catch (retryErr) {
+            const detail = extractErrorStatusAndMessage(retryErr);
+            throw new Error(
+              `OpenAI falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
+            );
+          }
+        } else {
+          const detail = extractErrorStatusAndMessage(firstErr);
+          throw new Error(
+            `OpenAI retornou HTTP 404 para "${req.model}" e nenhum modelo GPT ativo foi encontrado nessa chave (${detail.message}).`,
+          );
+        }
+      } else if (req.provider === 'google' && isNotFound404Error(firstErr)) {
         const discovery = await discoverActiveGoogleGeminiModel(req.apiKey, resolvedModel);
 
         if (discovery.selectedModel) {

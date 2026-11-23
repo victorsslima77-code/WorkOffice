@@ -59,9 +59,19 @@ export interface LlmModelCatalogEntry {
 
 export const LLM_MODEL_CATALOG: readonly LlmModelCatalogEntry[] = [
   {
+    id: 'claude-haiku-4-5-20251001',
+    provider: 'anthropic',
+    displayName: 'Claude Haiku 4.5',
+    family: 'haiku',
+    supportsThinking: true,
+    inputCostPerMillionUsd: 1.0,
+    outputCostPerMillionUsd: 5.0,
+    recommendedEfforts: ['low', 'medium'],
+  },
+  {
     id: 'claude-3-5-haiku-latest',
     provider: 'anthropic',
-    displayName: 'Claude 3.5 Haiku',
+    displayName: 'Claude 3.5 Haiku (Legado)',
     family: 'haiku',
     supportsThinking: false,
     inputCostPerMillionUsd: 0.8,

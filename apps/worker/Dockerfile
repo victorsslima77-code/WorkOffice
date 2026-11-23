@@ -19,6 +19,7 @@ WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml turbo.json tsconfig.base.json ./
 COPY packages/shared/package.json ./packages/shared/package.json
 COPY apps/worker/package.json ./apps/worker/package.json
+COPY apps/web/package.json ./apps/web/package.json
 
 RUN pnpm install --frozen-lockfile --filter @workoffice/shared --filter @workoffice/worker
 

@@ -492,7 +492,7 @@ export async function processQueuedAgentTask(
   } catch (err) {
     const errMsg = (err as Error).message || 'Erro desconhecido na execucao da tarefa.';
     const isNonRetryableApiError =
-      /\b(400|401|403|404)\b|bloqueou upload simulado|fallback mockup bloqueado|credenciais OAuth reais/i.test(
+      /\b(400|401|403|404)\b|Falha na chamada|API key not valid|invalid.*api.?key|authentication_error|permission_error|not_found_error|credit balance|bloqueou upload simulado|fallback mockup bloqueado|credenciais OAuth reais|nenhum vídeo real encontrado|não foi possível localizar nenhum vídeo real/i.test(
         errMsg,
       );
 
