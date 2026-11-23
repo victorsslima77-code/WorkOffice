@@ -12,9 +12,44 @@ import {
   type WorkerRepository,
   type WorkerTaskRecord,
 } from './worker-engine.js';
+import type { YoutubeOAuthCredentials } from './tools/publisher-youtube-tools.js';
 
 export class SupabaseWorkerRepository implements WorkerRepository {
   constructor(private readonly supabase: SupabaseClient) {}
+
+  getStorageClient(): SupabaseClient {
+    return this.supabase;
+  }
+
+  async getOfficeYoutubeOAuth(officeId: string): Promise<YoutubeOAuthCredentials | null> {
+    const { data, error } = await this.supabase.rpc('get_office_youtube_secret_for_worker', {
+      p_office_id: officeId,
+    });
+
+    if (error || !data) {
+      return null;
+    }
+
+    const raw = data as {
+      channel_id?: string;
+      client_id?: string;
+      client_secret?: string;
+      refresh_token?: string;
+      metadata?: Record<string, unknown>;
+    };
+
+    if (!raw.refresh_token) {
+      return null;
+    }
+
+    return {
+      channelId: raw.channel_id ?? 'UC_channel',
+      clientId: raw.client_id ?? '',
+      clientSecret: raw.client_secret ?? '',
+      refreshToken: raw.refresh_token,
+      metadata: raw.metadata ?? {},
+    };
+  }
 
   async getTaskById(taskId: string): Promise<WorkerTaskRecord | null> {
     const { data, error } = await this.supabase

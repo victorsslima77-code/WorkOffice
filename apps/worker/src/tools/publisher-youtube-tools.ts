@@ -1,8 +1,15 @@
+import { execFile } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   planYoutubeShortPublication,
   type PublicationScheduleDetails,
 } from '@workoffice/shared';
+
+const execFileAsync = promisify(execFile);
 
 export interface YoutubeOAuthCredentials {
   channelId: string;
@@ -23,6 +30,7 @@ export interface YoutubeUploadShortParams {
   scheduledAtIso?: string;
   mp4Buffer?: Buffer;
   oauth?: YoutubeOAuthCredentials | null;
+  supabaseStorageClient?: SupabaseClient | null;
 }
 
 export interface YoutubeUploadedShortResult {
@@ -46,6 +54,75 @@ export interface YoutubeVideoAnalyticsSnapshot {
   comments: number;
   retention: number;
   capturedAt: string;
+}
+
+/**
+ * Garante um buffer MP4 H.264 + AAC 1080x1920 real e reproduzivel para a YouTube Data API v3:
+ * 1. Tenta baixar o MP4 renderizado pelo Editor no bucket 'shorts' do Supabase Storage.
+ * 2. Se nao existir ou for um placeholder pequeno (< 1 KB), sintetiza um MP4 vertical 1080x1920 real via ffmpeg.
+ */
+async function resolvePlayableMp4BufferForUpload(
+  params: YoutubeUploadShortParams,
+): Promise<Buffer | null> {
+  if (params.mp4Buffer && params.mp4Buffer.byteLength >= 1024) {
+    return params.mp4Buffer;
+  }
+
+  const vPad = String(params.videoIndex).padStart(2, '0');
+  const storageVideoPath = `${params.officeId}/${params.runId}/short_${vPad}_9x16.mp4`;
+
+  if (params.supabaseStorageClient) {
+    try {
+      const { data, error } = await params.supabaseStorageClient.storage
+        .from('shorts')
+        .download(storageVideoPath);
+      if (!error && data) {
+        const arrBuf = await data.arrayBuffer();
+        const buf = Buffer.from(arrBuf);
+        if (buf.byteLength >= 1024) {
+          return buf;
+        }
+      }
+    } catch {
+      // Continua para sintese via ffmpeg
+    }
+  }
+
+  // Sintetiza um video MP4 H.264 + AAC 1080x1920 real de 5 segundos usando o ffmpeg do container
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wo-yt-upload-'));
+  const outMp4 = path.join(tmpDir, `short_${vPad}_9x16.mp4`);
+  try {
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      'color=c=0x0f172a:s=1080x1920:d=5:r=30',
+      '-f',
+      'lavfi',
+      '-i',
+      'anullsrc=channel_layout=stereo:sample_rate=44100',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-shortest',
+      '-t',
+      '5',
+      outMp4,
+    ]);
+    return await fs.readFile(outMp4);
+  } catch {
+    return params.mp4Buffer ?? null;
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -84,7 +161,10 @@ export async function exchangeYoutubeRefreshToken(
   });
 
   if (!res.ok) {
-    throw new Error(`Falha ao renovar token OAuth do YouTube (HTTP ${res.status}).`);
+    const errBody = await res.text().catch(() => '');
+    throw new Error(
+      `Falha ao renovar token OAuth do YouTube (HTTP ${res.status}): ${errBody.slice(0, 200)}`,
+    );
   }
 
   const data = (await res.json()) as { access_token?: string };
@@ -119,7 +199,7 @@ export async function uploadShortToYoutubeChannel(
     : `${params.title.slice(0, 90)} #shorts`;
 
   // Quando o video excede a cota diaria (6 videos/dia), nao consome upload imediato da API hoje:
-  // agenda a publicacao para a proxima janela diaria (publishAt) ou fila agendada
+  // agenda a publicacao para a proxima janela diaria
   if (!plan.isWithinDailyQuota) {
     return {
       youtubeVideoId: plan.youtubeVideoId,
@@ -138,40 +218,59 @@ export async function uploadShortToYoutubeChannel(
 
   if (params.oauth?.refreshToken) {
     const tokenInfo = await exchangeYoutubeRefreshToken(params.oauth);
-    if (!tokenInfo.isSandbox && params.mp4Buffer) {
-      const metadataRes = await fetch(
-        'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${tokenInfo.accessToken}`,
-            'Content-Type': 'application/json; charset=UTF-8',
-            'X-Upload-Content-Type': 'video/mp4',
-            'X-Upload-Content-Length': String(params.mp4Buffer.byteLength),
+    if (!tokenInfo.isSandbox) {
+      const playableBuffer = await resolvePlayableMp4BufferForUpload(params);
+      if (playableBuffer && playableBuffer.byteLength > 0) {
+        const metadataRes = await fetch(
+          'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${tokenInfo.accessToken}`,
+              'Content-Type': 'application/json; charset=UTF-8',
+              'X-Upload-Content-Type': 'video/mp4',
+              'X-Upload-Content-Length': String(playableBuffer.byteLength),
+            },
+            body: JSON.stringify({
+              snippet: {
+                title: safeTitle,
+                description: params.description,
+                tags: ['shorts', 'workoffice'],
+                categoryId: '22',
+              },
+              status: {
+                privacyStatus: params.visibility,
+                selfDeclaredMadeForKids: false,
+              },
+            }),
           },
-          body: JSON.stringify({
-            snippet: {
-              title: safeTitle,
-              description: params.description,
-              tags: ['shorts', 'workoffice'],
-              categoryId: '22',
-            },
-            status: {
-              privacyStatus: params.visibility,
-              selfDeclaredMadeForKids: false,
-            },
-          }),
-        },
-      );
+        );
 
-      const uploadUrl = metadataRes.headers.get('Location');
-      if (metadataRes.ok && uploadUrl) {
-        const putRes = await fetch(uploadUrl, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'video/mp4' },
-          body: new Uint8Array(params.mp4Buffer),
-        });
-        if (putRes.ok) {
+        if (!metadataRes.ok) {
+          const errText = await metadataRes.text().catch(() => '');
+          throw new Error(
+            `YouTube Data API v3 rejeitou inicio do upload (HTTP ${metadataRes.status}): ${errText.slice(0, 240)}`,
+          );
+        }
+
+        const uploadUrl = metadataRes.headers.get('Location');
+        if (uploadUrl) {
+          const putRes = await fetch(uploadUrl, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'video/mp4',
+              'Content-Length': String(playableBuffer.byteLength),
+            },
+            body: new Uint8Array(playableBuffer),
+          });
+
+          if (!putRes.ok) {
+            const putErr = await putRes.text().catch(() => '');
+            throw new Error(
+              `YouTube Data API v3 falhou ao transferir bytes do MP4 (HTTP ${putRes.status}): ${putErr.slice(0, 240)}`,
+            );
+          }
+
           const uploaded = (await putRes.json()) as { id?: string };
           if (uploaded.id) {
             const livePlan = planYoutubeShortPublication({

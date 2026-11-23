@@ -1,3 +1,4 @@
+import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   getDefaultNextDeskSlot,
   PublishReportOutputSchema,
@@ -11,6 +12,7 @@ import {
 } from '@workoffice/shared';
 import { runRoleWithMultiProviderLlm } from './llm-adapter.js';
 import type { ToolExecutionContext } from './tool-registry.js';
+import type { YoutubeOAuthCredentials } from './tools/publisher-youtube-tools.js';
 
 export interface WorkerTaskRecord {
   id: string;
@@ -51,6 +53,8 @@ export interface WorkerRepository {
   getNextRoleSlugsFromWorkflow(officeId: string, currentRoleSlug: RoleSlug): Promise<RoleSlug[]>;
   getAgentMonthlyTokensUsed(agentId: string): Promise<number>;
   getDecryptedSecretForAgent(agentId: string): Promise<string>;
+  getOfficeYoutubeOAuth?(officeId: string): Promise<YoutubeOAuthCredentials | null>;
+  getStorageClient?(): SupabaseClient | null;
   updateTaskStatus(
     taskId: string,
     patch: {
@@ -244,6 +248,15 @@ export async function processQueuedAgentTask(
     });
 
     const apiKey = await repo.getDecryptedSecretForAgent(agent.id);
+    const youtubeOAuth = (await repo.getOfficeYoutubeOAuth?.(agent.office_id)) ?? null;
+    const storageClient = repo.getStorageClient?.() ?? null;
+
+    const upstreamClips = (
+      task.input as {
+        clips?: { source_url?: string; start_sec?: number; end_sec?: number }[];
+      }
+    ).clips;
+    const firstClip = upstreamClips?.[0];
 
     const toolContext: ToolExecutionContext = {
       officeId: agent.office_id,
@@ -255,6 +268,11 @@ export async function processQueuedAgentTask(
       videoIndex,
       totalVideos,
       instruction,
+      sourceUrl: firstClip?.source_url,
+      startSec: firstClip?.start_sec,
+      endSec: firstClip?.end_sec,
+      youtubeOAuth,
+      supabaseStorageClient: storageClient,
       abortSignal: options?.abortSignal,
       emitVisualEvent: async (ev) => {
         await repo.insertAgentEvent({

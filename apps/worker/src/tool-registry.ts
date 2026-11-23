@@ -4,6 +4,7 @@ import {
   fetchShortAnalyticsSnapshot,
   uploadShortToYoutubeChannel,
   type YoutubeOAuthCredentials,
+  type YoutubeUploadedShortResult,
 } from './tools/publisher-youtube-tools.js';
 import {
   extractBestTranscriptWindowForShort,
@@ -37,6 +38,7 @@ export interface ToolExecutionContext {
   endSec?: number;
   youtubeOAuth?: YoutubeOAuthCredentials | null;
   supabaseStorageClient?: SupabaseClient | null;
+  lastUploadedShort?: YoutubeUploadedShortResult | null;
   abortSignal?: AbortSignal;
   emitVisualEvent: (params: {
     type: AgentEventType;
@@ -262,7 +264,10 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         description: `Short produzido e publicado automaticamente pelo WorkOffice: ${ctx.instruction} #shorts`,
         visibility: 'private',
         oauth: ctx.youtubeOAuth,
+        supabaseStorageClient: ctx.supabaseStorageClient,
       });
+
+      ctx.lastUploadedShort = uploaded;
 
       await ctx.emitVisualEvent({
         type: 'publish.upload',
@@ -270,8 +275,8 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         progress: 50,
         message:
           uploaded.publicationStatus === 'published'
-            ? `Short #${ctx.videoIndex}/${ctx.totalVideos} publicado dentro da cota diária: ${uploaded.url}`
-            : `Cota diária (6/dia) atingida! Short #${ctx.videoIndex}/${ctx.totalVideos} encaminhado para agendamento automático.`,
+            ? `Short #${ctx.videoIndex}/${ctx.totalVideos} publicado no YouTube (${uploaded.mode}): ${uploaded.url}`
+            : `Cota diária (6/dia) atingida! Short #${ctx.videoIndex}/${ctx.totalVideos} agendado: ${uploaded.outputSummary}`,
       });
 
       return uploaded;
@@ -285,15 +290,20 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     visualEventType: 'publish.upload',
     defaultProgress: 75,
     async execute(_args, ctx) {
-      const uploaded = await uploadShortToYoutubeChannel({
-        officeId: ctx.officeId,
-        runId: ctx.runId,
-        videoIndex: ctx.videoIndex,
-        title: `Vídeo #${ctx.videoIndex}/${ctx.totalVideos} — ${ctx.instruction}`,
-        description: `Short produzido pelo WorkOffice: ${ctx.instruction} #shorts`,
-        visibility: 'private',
-        oauth: ctx.youtubeOAuth,
-      });
+      const uploaded =
+        ctx.lastUploadedShort ??
+        (await uploadShortToYoutubeChannel({
+          officeId: ctx.officeId,
+          runId: ctx.runId,
+          videoIndex: ctx.videoIndex,
+          title: `Vídeo #${ctx.videoIndex}/${ctx.totalVideos} — ${ctx.instruction}`,
+          description: `Short produzido pelo WorkOffice: ${ctx.instruction} #shorts`,
+          visibility: 'private',
+          oauth: ctx.youtubeOAuth,
+          supabaseStorageClient: ctx.supabaseStorageClient,
+        }));
+
+      ctx.lastUploadedShort = uploaded;
 
       await ctx.emitVisualEvent({
         type: 'publish.upload',
@@ -318,7 +328,11 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
     defaultProgress: 95,
     async execute(args, ctx) {
       const vPad = String(ctx.videoIndex).padStart(2, '0');
-      const ytId = String(args.youtube_video_id ?? `yt_${ctx.runId.slice(0, 6)}_${vPad}`);
+      const ytId = String(
+        ctx.lastUploadedShort?.youtubeVideoId ??
+          args.youtube_video_id ??
+          `yt_${ctx.runId.slice(0, 6)}_${vPad}`,
+      );
       const snapshot = await fetchShortAnalyticsSnapshot({
         youtubeVideoId: ytId,
         videoIndex: ctx.videoIndex,
@@ -329,7 +343,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         type: 'metrics.check',
         toolName: 'youtube_fetch_analytics',
         progress: 95,
-        message: `Métricas do Vídeo #${ctx.videoIndex}/${ctx.totalVideos}: ${snapshot.views} views • ${snapshot.retention}% retenção`,
+        message: `Métricas do Vídeo #${ctx.videoIndex}/${ctx.totalVideos} (${ytId}): ${snapshot.views} views • ${snapshot.retention}% retenção`,
       });
 
       return snapshot;

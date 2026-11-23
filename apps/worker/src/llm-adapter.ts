@@ -201,7 +201,8 @@ export async function runRoleWithMultiProviderLlm(
       ],
     };
   } else {
-    const ytId = `yt_${ctx.runId.slice(0, 6)}_${vPad}`;
+    const uploaded = ctx.lastUploadedShort;
+    const ytId = uploaded?.youtubeVideoId ?? `yt_${ctx.runId.slice(0, 6)}_${vPad}`;
     const pubPlan = planYoutubeShortPublication({
       videoIndex: vNum,
       videoId: ytId,
@@ -209,16 +210,19 @@ export async function runRoleWithMultiProviderLlm(
     rawOutput = {
       published_videos: [
         {
-          youtube_video_id: pubPlan.youtubeVideoId,
-          url: pubPlan.shortUrl,
-          title: `Vídeo #${vNum}/${ctx.totalVideos} — ${ctx.instruction.slice(0, 60)} #shorts`,
-          visibility: 'private',
-          publication_status: pubPlan.publicationStatus,
-          scheduled_at: pubPlan.scheduledAtIso,
-          quota_units_consumed: pubPlan.quotaUnitsConsumed,
-          daily_quota_limit_videos: pubPlan.dailyQuotaLimitVideos,
-          schedule_details: pubPlan.scheduleDetails,
-          output_summary: pubPlan.outputSummary,
+          youtube_video_id: uploaded?.youtubeVideoId ?? pubPlan.youtubeVideoId,
+          url: uploaded?.url ?? pubPlan.shortUrl,
+          title:
+            uploaded?.title ??
+            `Vídeo #${vNum}/${ctx.totalVideos} — ${ctx.instruction.slice(0, 60)} #shorts`,
+          visibility: uploaded?.visibility ?? 'private',
+          publication_status: uploaded?.publicationStatus ?? pubPlan.publicationStatus,
+          scheduled_at: uploaded?.scheduledAt ?? pubPlan.scheduledAtIso,
+          quota_units_consumed: uploaded?.quotaUnitsConsumed ?? pubPlan.quotaUnitsConsumed,
+          daily_quota_limit_videos:
+            uploaded?.dailyQuotaLimitVideos ?? pubPlan.dailyQuotaLimitVideos,
+          schedule_details: uploaded ? uploaded.scheduleDetails : pubPlan.scheduleDetails,
+          output_summary: uploaded?.outputSummary ?? pubPlan.outputSummary,
         },
       ],
     };

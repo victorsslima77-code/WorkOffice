@@ -82,15 +82,18 @@ export function OfficeInteractiveStage({
   headerActions,
 }: OfficeInteractiveStageProps) {
   const [instructionInput, setInstructionInput] = useState(
-    'Crie 10 vídeos do vídeo game novo',
+    officeId ? '' : 'Crie 10 vídeos do vídeo game novo',
   );
   const [activeInstruction, setActiveInstruction] = useState(
-    'Crie 10 vídeos do vídeo game novo',
+    officeId ? '' : 'Crie 10 vídeos do vídeo game novo',
   );
 
+  const effectiveInstruction =
+    instructionInput.trim() || activeInstruction.trim() || 'Crie 3 vídeos sobre o tema solicitado';
+
   const scenarioSteps = useMemo(
-    () => buildMockShortsScenarioSteps(agents, activeInstruction),
-    [agents, activeInstruction],
+    () => buildMockShortsScenarioSteps(agents, effectiveInstruction),
+    [agents, effectiveInstruction],
   );
 
   const {
@@ -177,7 +180,7 @@ export function OfficeInteractiveStage({
     setConnectionStatus('connecting');
 
     async function hydrateFromDatabase() {
-      const [eventsRes, llmCallsRes, artifactsRes] = await Promise.all([
+      const [eventsRes, llmCallsRes, artifactsRes, latestRunRes] = await Promise.all([
         supabase
           .from('agent_events')
           .select('id, office_id, agent_id, task_id, type, payload, created_at')
@@ -199,9 +202,22 @@ export function OfficeInteractiveStage({
           .eq('runs.office_id', officeId)
           .order('created_at', { ascending: false })
           .limit(40),
+        supabase
+          .from('runs')
+          .select('id, input, status')
+          .eq('office_id', officeId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
       ]);
 
       if (!mounted) return;
+
+      const lastRunInstruction = (latestRunRes.data?.input as { instruction?: string } | null)
+        ?.instruction;
+      if (lastRunInstruction && lastRunInstruction.trim()) {
+        setActiveInstruction(lastRunInstruction.trim());
+      }
 
       const persistedEvents = (eventsRes.data ?? []) as unknown as PersistedAgentEventRow[];
       if (persistedEvents.length > 0) {
@@ -398,11 +414,12 @@ export function OfficeInteractiveStage({
     };
   }, [officeId, agents, setConnectionStatus, setLastSyncedEventId, setReplayHistory]);
 
-  // 2. Stepper automatico quando uma Run real no banco esta ativa em /app/offices/[id]
+  // 2. Stepper / Polling automatico quando uma Run real no banco esta ativa em /app/offices/[id]
   useEffect(() => {
     if (!isLiveDatabaseRunActive || !officeId) return;
 
-    const intervalMs = Math.max(950, Math.round(2900 / playbackSpeed));
+    const supabase = createSupabaseBrowserClient();
+    const intervalMs = Math.max(950, Math.round(2800 / playbackSpeed));
     const timer = setInterval(async () => {
       try {
         const res = await fetch('/api/runs/step', {
@@ -414,6 +431,142 @@ export function OfficeInteractiveStage({
           }),
         });
         const data = await res.json();
+
+        // Sincroniza artifacts (Caixa de Entrada/Saida) e llm_calls produzidos pelo Worker real no banco
+        const [llmCallsRes, artifactsRes] = await Promise.all([
+          supabase
+            .from('llm_calls')
+            .select('agent_id, input_tokens, output_tokens, reasoning_tokens, cost_usd, created_at')
+            .in(
+              'agent_id',
+              agents.map((a) => a.id),
+            )
+            .order('created_at', { ascending: false })
+            .limit(100),
+          supabase
+            .from('artifacts')
+            .select('id, kind, storage_path, metadata, created_at, runs!inner(office_id)')
+            .eq('runs.office_id', officeId)
+            .order('created_at', { ascending: false })
+            .limit(40),
+        ]);
+
+        if (llmCallsRes.data && llmCallsRes.data.length > 0) {
+          setAgentCosts((prev) => {
+            const next = { ...prev };
+            for (const ag of agents) {
+              const agCalls = llmCallsRes.data.filter((c) => c.agent_id === ag.id);
+              if (agCalls.length === 0) continue;
+              const totalTok = agCalls.reduce(
+                (s, c) =>
+                  s +
+                  Number(c.input_tokens ?? 0) +
+                  Number(c.output_tokens ?? 0) +
+                  Number(c.reasoning_tokens ?? 0),
+                0,
+              );
+              const totalCost = agCalls.reduce((s, c) => s + Number(c.cost_usd ?? 0), 0);
+              const latestCost = Number(agCalls[0]?.cost_usd ?? 0);
+              next[ag.id] = {
+                tokens: totalTok,
+                lastTaskCostUsd: latestCost,
+                completedTasksCount: agCalls.length,
+                dailyCostUsd: Number(totalCost.toFixed(5)),
+              };
+            }
+            return next;
+          });
+        }
+
+        if (artifactsRes.data && artifactsRes.data.length > 0) {
+          const nextOutbox: Record<string, AgentArtifactItem[]> = {};
+          const nextInbox: Record<string, AgentArtifactItem[]> = {};
+          for (const ag of agents) {
+            nextOutbox[ag.id] = [];
+            nextInbox[ag.id] = [];
+          }
+
+          for (const row of artifactsRes.data) {
+            const meta = (row.metadata ?? {}) as {
+              title?: string;
+              agent_id?: string;
+              role_slug?: string;
+              video_index?: number;
+              output?: {
+                published_videos?: {
+                  url?: string;
+                  output_summary?: string;
+                }[];
+              };
+            };
+            const timeStr = new Date(row.created_at as string).toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+            });
+            const inferredRole: string =
+              meta.role_slug ??
+              (row.kind === 'research_brief'
+                ? 'scriptwriter'
+                : row.kind === 'edited_short'
+                  ? 'video_editor'
+                  : 'publisher_analyst');
+            const producer =
+              agents.find((a) => a.id === meta.agent_id) ??
+              agents.find((a) => a.roleSlug === inferredRole);
+            const itemTitle = meta.title ?? `${row.kind}_${String(row.id).slice(0, 6)}.json`;
+            const pubVideo = meta.output?.published_videos?.[0];
+
+            if (producer && nextOutbox[producer.id]) {
+              nextOutbox[producer.id]!.push({
+                id: String(row.id),
+                title: itemTitle,
+                kind: String(row.kind),
+                storagePath: (row.storage_path as string | null) ?? null,
+                fromOrTo:
+                  pubVideo?.output_summary ??
+                  (pubVideo?.url ? `URL Publicada: ${pubVideo.url}` : 'Persistido no Storage/DB'),
+                timestamp: timeStr,
+                status: 'delivered',
+                metadata: meta as Record<string, unknown>,
+              });
+            }
+
+            if (inferredRole === 'scriptwriter') {
+              const editor = agents.find((a) => a.roleSlug === 'video_editor');
+              if (editor && nextInbox[editor.id]) {
+                nextInbox[editor.id]!.push({
+                  id: `in_${row.id}`,
+                  title: itemTitle,
+                  kind: String(row.kind),
+                  storagePath: (row.storage_path as string | null) ?? null,
+                  fromOrTo: 'Na estante (do Roteirista)',
+                  timestamp: timeStr,
+                  status: 'pending',
+                  metadata: meta as Record<string, unknown>,
+                });
+              }
+            } else if (inferredRole === 'video_editor') {
+              const publisher = agents.find((a) => a.roleSlug === 'publisher_analyst');
+              if (publisher && nextInbox[publisher.id]) {
+                nextInbox[publisher.id]!.push({
+                  id: `in_${row.id}`,
+                  title: itemTitle,
+                  kind: String(row.kind),
+                  storagePath: (row.storage_path as string | null) ?? null,
+                  fromOrTo: 'Na estante (do Editor)',
+                  timestamp: timeStr,
+                  status: 'pending',
+                  metadata: meta as Record<string, unknown>,
+                });
+              }
+            }
+          }
+
+          setOutboxByAgent(nextOutbox);
+          setInboxByAgent(nextInbox);
+        }
+
         if (!res.ok || !data.stepResult?.has_more) {
           setIsLiveDatabaseRunActive(false);
         }
@@ -423,7 +576,7 @@ export function OfficeInteractiveStage({
     }, intervalMs);
 
     return () => clearInterval(timer);
-  }, [isLiveDatabaseRunActive, officeId, activeDatabaseRunId, playbackSpeed]);
+  }, [isLiveDatabaseRunActive, officeId, activeDatabaseRunId, playbackSpeed, agents]);
 
   // 3. Player de Replay Historico a partir dos eventos persistidos no banco
   useEffect(() => {
@@ -882,32 +1035,14 @@ export function OfficeInteractiveStage({
   }
 
   async function handleDispatchInstructionToScriptwriter() {
-    const clean = instructionInput.trim() || 'Crie 10 vídeos do vídeo game novo';
+    const clean =
+      instructionInput.trim() ||
+      activeInstruction.trim() ||
+      'Crie 3 vídeos sobre o tema solicitado';
     setActiveInstruction(clean);
+    setInstructionInput(clean);
     setRunsCount((prev) => prev + 1);
     setCurrentStepIdx(-1);
-
-    // Se estamos dentro de um escritorio real no banco (officeId), dispara tambem a Run real via API/Postgres + Realtime!
-    if (officeId) {
-      try {
-        const res = await fetch('/api/runs', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            officeId,
-            instruction: clean,
-            clipCount: parseRequestedVideoCount(clean),
-          }),
-        });
-        const data = await res.json();
-        if (res.ok && data.run?.run_id) {
-          setActiveDatabaseRunId(String(data.run.run_id));
-          setIsLiveDatabaseRunActive(true);
-        }
-      } catch {
-        // Continua com a visualizacao local caso offline
-      }
-    }
 
     const initialStates: Record<string, ActiveAgentVisualState> = {};
     const emptyBoxes: Record<string, AgentArtifactItem[]> = {};
@@ -924,6 +1059,29 @@ export function OfficeInteractiveStage({
     setActiveStates(initialStates);
     setInboxByAgent(emptyBoxes);
     setOutboxByAgent(emptyBoxes);
+
+    // Se estamos dentro de um escritorio real no banco (officeId), dispara a Run real no Postgres/pgmq para o Worker da Railway processar!
+    if (officeId) {
+      try {
+        const res = await fetch('/api/runs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            officeId,
+            instruction: clean,
+            clipCount: parseRequestedVideoCount(clean),
+          }),
+        });
+        const data = await res.json();
+        if (res.ok && data.run?.run_id) {
+          setActiveDatabaseRunId(String(data.run.run_id));
+          setIsLiveDatabaseRunActive(true);
+          return;
+        }
+      } catch {
+        // Fallback para simulacao local apenas se a API falhar
+      }
+    }
 
     setTimeout(() => {
       const freshSteps = buildMockShortsScenarioSteps(agents, clean);
@@ -1636,10 +1794,21 @@ export function OfficeInteractiveStage({
             <button
               type="button"
               onClick={() => {
+                const nextClean =
+                  instructionInput.trim() ||
+                  activeInstruction.trim() ||
+                  'Crie 3 vídeos sobre o tema solicitado';
+                if (nextClean !== activeInstruction) {
+                  setActiveInstruction(nextClean);
+                }
                 if (!isPlaying && currentStepIdx >= scenarioSteps.length - 1) {
                   handleResetSimulation();
                 }
                 if (!isPlaying && currentStepIdx === -1) {
+                  if (officeId) {
+                    void handleDispatchInstructionToScriptwriter();
+                    return;
+                  }
                   advanceScenarioStep(0);
                 }
                 setIsPlaying((prev) => !prev);

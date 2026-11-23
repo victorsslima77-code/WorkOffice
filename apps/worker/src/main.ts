@@ -6,13 +6,14 @@ import {
   SupabaseWorkerRepository,
 } from './supabase-repository.js';
 
-async function startWorkerDaemon() {
+export async function startWorkerDaemon() {
   const supabaseUrl =
     process.env.SUPABASE_URL ||
     process.env.NEXT_PUBLIC_SUPABASE_URL ||
     `https://${SUPABASE_TARGET_PROJECT_REF}.supabase.co`;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   const workerId = process.env.WORKER_ID || `worker-${process.pid}`;
+  const pollIntervalMs = Math.max(1000, Number(process.env.WORKER_POLL_INTERVAL_MS || 2000));
 
   if (!serviceRoleKey) {
     console.warn(
@@ -34,17 +35,19 @@ async function startWorkerDaemon() {
       await recordWorkerHeartbeat(supabase, workerId, activeCount, totalProcessed);
       activeCount = 1;
       const count = await pollAndDrainQueueBatch(supabase, repo, 3);
+      if (count > 0) {
+        console.log(`[WorkOffice Worker] Processadas ${count} task(s) da fila pgmq.`);
+      }
       totalProcessed += count;
       activeCount = 0;
+      await recordWorkerHeartbeat(supabase, workerId, activeCount, totalProcessed);
     } catch (err) {
       activeCount = 0;
       console.error('[WorkOffice Worker] Erro no loop principal:', (err as Error).message);
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  void startWorkerDaemon();
-}
+void startWorkerDaemon();

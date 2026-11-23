@@ -28,5 +28,6 @@ COPY apps/worker ./apps/worker
 RUN pnpm --filter @workoffice/shared build && pnpm --filter @workoffice/worker build
 
 ENV NODE_ENV=production
+ENV ENABLE_NATIVE_FFMPEG=true
 
 CMD ["node", "apps/worker/dist/main.js"]
