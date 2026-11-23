@@ -334,7 +334,7 @@ describe('@workoffice/worker — Etapa 5 (Worker Core, Multi-Provedor, Tool Regi
     expect(env.events.some((e) => e.type === 'budget.exceeded')).toBe(true);
   });
 
-  it('nao silencia erro HTTP 404/401 em chave real nem gera fallback mockup source_01', async () => {
+  it('nao silencia erro HTTP 404/401 em chave real nem executa nenhuma ferramenta da atividade quando a LLM falha', async () => {
     const env = createInMemoryWorkerRepository();
     env.agents['ag-scriptwriter']!.provider = 'google';
     env.agents['ag-scriptwriter']!.model = 'gemini-2.5-pro';
@@ -344,5 +344,9 @@ describe('@workoffice/worker — Etapa 5 (Worker Core, Multi-Provedor, Tool Regi
     expect(outcome.status).toBe('failed');
     expect(env.artifacts).toHaveLength(0);
     expect(env.events.some((e) => e.type === 'task.failed')).toBe(true);
+    // Garantia de preflight: NENHUMA ferramenta de pesquisa/edicao/publicacao foi executada antes da LLM responder!
+    expect(env.events.some((e) => e.type === 'research.web_search')).toBe(false);
+    expect(env.events.some((e) => e.type === 'research.read_source')).toBe(false);
+    expect(env.events.some((e) => e.type === 'handoff.sent')).toBe(false);
   }, 15_000);
 });

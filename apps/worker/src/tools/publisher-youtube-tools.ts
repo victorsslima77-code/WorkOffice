@@ -26,6 +26,7 @@ export interface YoutubeUploadShortParams {
   alreadyPublishedTodayCount?: number;
   title: string;
   description: string;
+  tags?: string[];
   visibility: 'private' | 'unlisted' | 'public';
   scheduledAtIso?: string;
   mp4Buffer?: Buffer;
@@ -242,7 +243,10 @@ export async function uploadShortToYoutubeChannel(
               snippet: {
                 title: safeTitle,
                 description: params.description,
-                tags: ['shorts', 'workoffice'],
+                tags:
+                  params.tags && params.tags.length > 0
+                    ? params.tags.slice(0, 20)
+                    : ['shorts', 'workoffice'],
                 categoryId: '22',
               },
               status: {

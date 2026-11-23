@@ -100,6 +100,9 @@ interface ParsedScriptwriterLlmJson {
   start_sec?: number;
   end_sec?: number;
   suggested_title?: string;
+  seo_description?: string;
+  seo_tags?: string[];
+  subtitle_instructions?: string;
   hook?: string;
   rationale?: string;
   score?: number;
@@ -109,7 +112,6 @@ interface ParsedVideoEditorLlmJson {
   subtitle_accent_color?: 'yellow' | 'red' | 'white' | 'green';
   highlight_words?: string[];
   apply_dynamic_zoom?: boolean;
-  polished_cues?: { startSec: number; endSec: number; text: string }[];
   suggested_title?: string;
   editing_notes?: string;
 }
@@ -395,6 +397,10 @@ async function callVertexExpressGenerateContent(params: {
 /**
  * Executa o pipeline de ferramentas e geracao estruturada para o cargo usando o Vercel AI SDK
  * (ou o modo deterministico Sandbox quando a credencial salva no Vault for `wo_test_...`).
+ *
+ * GARANTIA DE PREFLIGHT: Para chaves reais (!wo_test_), valida a chamada da LLM ANTES de executar
+ * qualquer ferramenta ou efeito colateral (pesquisa, download, transcricao, corte ou upload YouTube).
+ * Se a LLM falhar, encerra imediatamente com erro sem executar a atividade pedida.
  */
 export async function runRoleWithMultiProviderLlm(
   req: LlmAdapterRequest,
@@ -403,12 +409,228 @@ export async function runRoleWithMultiProviderLlm(
   const effortCfg = EFFORT_CONFIG_MAP[req.effort];
   const ctx = req.toolContext;
 
+  const isSandboxKey = req.apiKey.startsWith('wo_test_');
+  let resolvedModel = req.model;
+  let useVertexExpressForGoogle = false;
+  let inputTokens = Math.round(1100 * effortCfg.estimatedTokenMultiplier);
+  let outputTokens = Math.round(650 * effortCfg.estimatedTokenMultiplier);
+  const reasoningTokens =
+    effortCfg.thinkingBudgetTokens > 0 ? Math.round(effortCfg.thinkingBudgetTokens * 0.35) : 0;
+
   await ctx.emitVisualEvent({
     type: 'llm.thinking',
     message: `Processando Vídeo #${ctx.videoIndex}/${ctx.totalVideos} com ${req.provider.toUpperCase()} (${req.model} • esforço ${req.effort})`,
   });
 
-  // Executa as ferramentas permitidas pelo cargo na ordem operacional do pipeline (1 video por vez)
+  const invokeAiSdkCall = async (params: {
+    targetModel: string;
+    system: string;
+    prompt: string;
+    maxTokens: number;
+    includeProviderOpts: boolean;
+  }) => {
+    const providerModel =
+      req.provider === 'anthropic'
+        ? createAnthropic({ apiKey: req.apiKey })(params.targetModel)
+        : req.provider === 'google'
+          ? createGoogleGenerativeAI({ apiKey: req.apiKey })(params.targetModel)
+          : createOpenAI({ apiKey: req.apiKey })(params.targetModel);
+
+    return generateText({
+      model: providerModel,
+      system: params.system,
+      prompt: params.prompt,
+      maxTokens: params.maxTokens,
+      providerOptions: params.includeProviderOpts
+        ? (buildProviderSpecificOptions(req.provider, params.targetModel, req.effort) as never)
+        : undefined,
+      abortSignal: ctx.abortSignal,
+    });
+  };
+
+  const invokeLlmWithRecovery = async (params: {
+    system: string;
+    prompt: string;
+    maxTokens: number;
+    includeProviderOpts: boolean;
+  }): Promise<{ text: string; inputTokens: number; outputTokens: number }> => {
+    if (useVertexExpressForGoogle && req.provider === 'google') {
+      return callVertexExpressGenerateContent({
+        apiKey: req.apiKey,
+        modelId: resolvedModel,
+        systemPrompt: params.system,
+        prompt: params.prompt,
+        maxOutputTokens: params.maxTokens,
+        abortSignal: ctx.abortSignal,
+      });
+    }
+
+    try {
+      const llmRes = await invokeAiSdkCall({
+        targetModel: resolvedModel,
+        system: params.system,
+        prompt: params.prompt,
+        maxTokens: params.maxTokens,
+        includeProviderOpts: params.includeProviderOpts,
+      });
+      return {
+        text: llmRes.text.trim(),
+        inputTokens: llmRes.usage?.promptTokens ?? 0,
+        outputTokens: llmRes.usage?.completionTokens ?? 0,
+      };
+    } catch (firstErr) {
+      if (ctx.abortSignal?.aborted) {
+        throw new Error('Chamada LLM cancelada pelo usuário.');
+      }
+
+      if (req.provider === 'anthropic' && isNotFound404Error(firstErr)) {
+        const discovery = await discoverActiveAnthropicModel(req.apiKey, resolvedModel);
+        if (discovery.selectedModel) {
+          resolvedModel = discovery.selectedModel;
+          await ctx.emitVisualEvent({
+            type: 'llm.thinking',
+            message: `Modelo ${req.model} retornou 404 na Anthropic; usando modelo ativo "${resolvedModel}".`,
+          });
+          try {
+            const retryRes = await invokeAiSdkCall({
+              targetModel: resolvedModel,
+              system: params.system,
+              prompt: params.prompt,
+              maxTokens: params.maxTokens,
+              includeProviderOpts: false,
+            });
+            return {
+              text: retryRes.text.trim(),
+              inputTokens: retryRes.usage?.promptTokens ?? 0,
+              outputTokens: retryRes.usage?.completionTokens ?? 0,
+            };
+          } catch (retryErr) {
+            const detail = extractErrorStatusAndMessage(retryErr);
+            throw new Error(
+              `Anthropic falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
+            );
+          }
+        }
+        const detail = extractErrorStatusAndMessage(firstErr);
+        throw new Error(
+          `Anthropic retornou HTTP 404 para "${req.model}" e nenhum modelo Claude ativo foi encontrado nessa chave (${detail.message}).`,
+        );
+      }
+
+      if (req.provider === 'openai' && isNotFound404Error(firstErr)) {
+        const discovery = await discoverActiveOpenAiModel(req.apiKey, resolvedModel);
+        if (discovery.selectedModel) {
+          resolvedModel = discovery.selectedModel;
+          await ctx.emitVisualEvent({
+            type: 'llm.thinking',
+            message: `Modelo ${req.model} retornou 404 na OpenAI; usando modelo ativo "${resolvedModel}".`,
+          });
+          try {
+            const retryRes = await invokeAiSdkCall({
+              targetModel: resolvedModel,
+              system: params.system,
+              prompt: params.prompt,
+              maxTokens: params.maxTokens,
+              includeProviderOpts: false,
+            });
+            return {
+              text: retryRes.text.trim(),
+              inputTokens: retryRes.usage?.promptTokens ?? 0,
+              outputTokens: retryRes.usage?.completionTokens ?? 0,
+            };
+          } catch (retryErr) {
+            const detail = extractErrorStatusAndMessage(retryErr);
+            throw new Error(
+              `OpenAI falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
+            );
+          }
+        }
+        const detail = extractErrorStatusAndMessage(firstErr);
+        throw new Error(
+          `OpenAI retornou HTTP 404 para "${req.model}" e nenhum modelo GPT ativo foi encontrado nessa chave (${detail.message}).`,
+        );
+      }
+
+      if (req.provider === 'google' && isNotFound404Error(firstErr)) {
+        const discovery = await discoverActiveGoogleGeminiModel(req.apiKey, resolvedModel);
+        if (discovery.selectedModel) {
+          resolvedModel = discovery.selectedModel;
+          await ctx.emitVisualEvent({
+            type: 'llm.thinking',
+            message: `Modelo ${req.model} retornou 404 na chave Google AI Studio; usando modelo ativo "${resolvedModel}".`,
+          });
+          try {
+            const retryRes = await invokeAiSdkCall({
+              targetModel: resolvedModel,
+              system: params.system,
+              prompt: params.prompt,
+              maxTokens: params.maxTokens,
+              includeProviderOpts: false,
+            });
+            return {
+              text: retryRes.text.trim(),
+              inputTokens: retryRes.usage?.promptTokens ?? 0,
+              outputTokens: retryRes.usage?.completionTokens ?? 0,
+            };
+          } catch (retryErr) {
+            const detail = extractErrorStatusAndMessage(retryErr);
+            throw new Error(
+              `Google Gemini falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
+            );
+          }
+        }
+
+        if (req.apiKey.trim().startsWith('AQ.')) {
+          try {
+            const vertexRes = await callVertexExpressGenerateContent({
+              apiKey: req.apiKey,
+              modelId: resolvedModel,
+              systemPrompt: params.system,
+              prompt: params.prompt,
+              maxOutputTokens: params.maxTokens,
+              abortSignal: ctx.abortSignal,
+            });
+            useVertexExpressForGoogle = true;
+            return vertexRes;
+          } catch (vertexErr) {
+            const firstDetail = extractErrorStatusAndMessage(firstErr);
+            const vertexDetail = extractErrorStatusAndMessage(vertexErr);
+            throw new Error(
+              `Google AI Studio retornou HTTP 404 para "${req.model}" (${firstDetail.message}) e Vertex Express também falhou (${vertexDetail.message}). Verifique os modelos ativos na sua chave/projeto no Google AI Studio.`,
+            );
+          }
+        }
+
+        const detail = extractErrorStatusAndMessage(firstErr);
+        throw new Error(
+          `Google AI Studio retornou HTTP 404 para "${req.model}" e nenhum modelo alternativo com generateContent foi encontrado nessa chave (${detail.message}). Verifique se a chave/projeto tem acesso ativo aos modelos Gemini no Google AI Studio.`,
+        );
+      }
+
+      const detail = extractErrorStatusAndMessage(firstErr);
+      throw new Error(
+        `Falha na chamada ${req.provider.toUpperCase()} (${resolvedModel}) [HTTP ${detail.status ?? 'erro'}]: ${detail.message}`,
+      );
+    }
+  };
+
+  // GATEKEEPER OBRIGATORIO: Valida a chamada real da LLM ANTES de executar qualquer ferramenta ou atividade!
+  // Se a LLM falhar (ex.: chave Gemini 404/403/401, saldo zerado, etc.), aborta imediatamente com ZERO acoes executadas.
+  if (!isSandboxKey) {
+    const preflight = await invokeLlmWithRecovery({
+      system: 'You are a connectivity check. Reply with OK.',
+      prompt: 'OK',
+      maxTokens: 24,
+      includeProviderOpts: false,
+    });
+    if (!preflight.text) {
+      throw new Error(
+        `LLM ${req.provider.toUpperCase()} (${resolvedModel}) retornou resposta vazia no preflight — atividade cancelada antes de iniciar.`,
+      );
+    }
+  }
+
+  // Executa as ferramentas de entrada/preparo somente APOS o preflight da LLM confirmar sucesso!
   const vNum = ctx.videoIndex;
   const vPad = String(vNum).padStart(2, '0');
 
@@ -421,18 +643,7 @@ export async function runRoleWithMultiProviderLlm(
     // ANTES de chamar o LLM Editor (para o LLM revisar estilo/destaques seguindo o roteirista sem inventar falas!)
     await executeRegisteredTool('download_video_segment', {}, ctx);
     await executeRegisteredTool('transcribe_audio', {}, ctx);
-  } else if (req.roleSlug === 'publisher_analyst') {
-    await executeRegisteredTool('youtube_upload_short', {}, ctx);
-    await executeRegisteredTool('youtube_schedule_video', {}, ctx);
-    await executeRegisteredTool('youtube_fetch_analytics', {}, ctx);
   }
-
-  const isSandboxKey = req.apiKey.startsWith('wo_test_');
-  let resolvedModel = req.model;
-  let inputTokens = Math.round(1100 * effortCfg.estimatedTokenMultiplier);
-  let outputTokens = Math.round(650 * effortCfg.estimatedTokenMultiplier);
-  const reasoningTokens =
-    effortCfg.thinkingBudgetTokens > 0 ? Math.round(effortCfg.thinkingBudgetTokens * 0.35) : 0;
 
   let parsedScriptJson: ParsedScriptwriterLlmJson | null = null;
   let parsedEditorJson: ParsedVideoEditorLlmJson | null = null;
@@ -448,29 +659,32 @@ export async function runRoleWithMultiProviderLlm(
     let rolePrompt: string;
     if (req.roleSlug === 'scriptwriter') {
       const candidatesList = (ctx.candidateVideos ?? [])
-        .slice(0, 5)
+        .slice(0, 6)
         .map(
           (v, i) =>
-            `${i + 1}. URL: ${v.url} | Título Original: "${v.title}" | Canal: ${v.channelTitle} | Duração: ${v.durationSec}s${v.description ? ` | Resumo: ${v.description.slice(0, 140)}` : ''}`,
+            `${i + 1}. URL: ${v.url} | Título Original: "${v.title}" | Canal: ${v.channelTitle} | Views: ${(v.viewCount ?? 0).toLocaleString('pt-BR')} | Duração: ${v.durationSec}s${v.description ? ` | Resumo: ${v.description.slice(0, 140)}` : ''}`,
         )
         .join('\n');
 
       rolePrompt = [
         `Pedido do usuário: "${ctx.instruction}" (produzindo Vídeo #${vNum} de ${ctx.totalVideos}).`,
         candidatesList
-          ? `Vídeos REAIS encontrados no YouTube:\n${candidatesList}`
+          ? `Vídeos REAIS mais em alta encontrados no YouTube (ordenados por visualizações):\n${candidatesList}`
           : `URL de origem candidata: ${ctx.sourceUrl ?? 'não encontrada'}`,
         ctx.transcriptText
           ? `Contexto/descrição extraída do vídeo selecionado:\n${ctx.transcriptText.slice(0, 600)}`
           : '',
         `Retorne APENAS um JSON válido (sem markdown, sem comentários) com as chaves exatas:`,
         `{`,
-        `  "source_url": "<escolha uma URL REAL da lista acima>",`,
-        `  "start_sec": <numero inteiro em segundos, dentro da duracao do video>,`,
+        `  "source_url": "<escolha a URL REAL do vídeo mais em alta e relevante da lista acima>",`,
+        `  "start_sec": <numero inteiro em segundos indicando o ponto exato de maior interesse para iniciar o corte>,`,
         `  "end_sec": <numero inteiro em segundos, sendo end_sec - start_sec entre 25 e 58 segundos>,`,
-        `  "suggested_title": "<título viral, chamativo e natural em português para YouTube Shorts com até 85 caracteres terminando com #shorts — NUNCA repita o comando do usuário>",`,
-        `  "hook": "<frase curta de impacto para os 3 primeiros segundos do Short que prende a atenção>",`,
-        `  "rationale": "<instruções claras e detalhadas para o Editor: por que esse trecho retém audiência, ritmo de cortes, zoom e quais palavras destacar na legenda>",`,
+        `  "suggested_title": "<título viral e otimizado para SEO em português para YouTube Shorts com até 85 caracteres terminando com #shorts — NUNCA repita o comando do usuário>",`,
+        `  "seo_description": "<descrição completa otimizada para SEO do YouTube Shorts com palavras-chave relevantes sobre o vídeo e 4 a 6 hashtags no final incluindo #shorts>",`,
+        `  "seo_tags": ["<tag1>", "<tag2>", "<8 a 15 tags de SEO altamente relevantes sobre o assunto e o criador>"],`,
+        `  "hook": "<frase curta de impacto descrevendo o gancho dos 3 primeiros segundos>",`,
+        `  "subtitle_instructions": "<orientações VISUAIS sobre as legendas para o Editor: cor de destaque (amarelo, vermelho, verde ou branco), ritmo de cortes/zoom e estilo de destaque — lembrando que o Editor sempre legenda a FALA REAL do vídeo no idioma original>",`,
+        `  "rationale": "<por que este vídeo está em alta e por que o trecho start_sec..end_sec é o ponto de maior interesse para retenção>",`,
         `  "score": <nota de retenção de 75 a 99>`,
         `}`,
       ]
@@ -480,188 +694,53 @@ export async function runRoleWithMultiProviderLlm(
       const cuesPreview = (ctx.spokenSubtitleCues ?? []).slice(0, 45);
       const detectedLang = ctx.detectedVideoLanguage ?? 'original';
       rolePrompt = [
-        `Você recebeu a transcrição da FALA REAL do youtuber no corte (${ctx.startSec ?? 0}s–${ctx.endSec ?? 45}s) e as instruções de edição do Roteirista.`,
-        `Idioma original falado no vídeo: "${detectedLang}".`,
-        `Instruções do Roteirista (APENAS para estilo visual, ritmo, zoom e destaques — JAMAIS coloque essas instruções dentro da legenda!):`,
+        `Você é o Editor de Vídeo. A transcrição literal da FALA REAL do youtuber (${ctx.startSec ?? 0}s–${ctx.endSec ?? 45}s) JÁ foi extraída automaticamente no idioma original ("${detectedLang}") e será usada diretamente nas legendas do vídeo — NÃO reescreva nem traduza a fala.`,
+        `Orientações de estilo de legenda enviadas pelo Roteirista (APENAS para escolher cor, zoom e palavras-chave reais a destacar — JAMAIS serão inseridas como texto na legenda):`,
         `"${ctx.editingInstructions ?? 'Manter ritmo dinâmico e legendas legíveis.'}"`,
         cuesPreview.length > 0
-          ? `Falas reais extraídas do áudio do vídeo (JSON):\n${JSON.stringify(cuesPreview)}`
+          ? `Falas REAIS transcritas do vídeo (idioma "${detectedLang}"):\n${cuesPreview.map((c) => `- ${c.text}`).join('\n')}`
           : `Nenhuma fala foi detectada no áudio do vídeo.`,
-        `REGRAS OBRIGATÓRIAS:`,
-        `1. JAMAIS insira instruções do roteirista (como "abra com zoom", "cortes dinâmicos", "destaque em vermelho") no texto das legendas.`,
-        `2. MANTENHA 100% O IDIOMA ORIGINAL DO VÍDEO ("${detectedLang}"): se o youtuber fala em português, legende em português; se fala em inglês, legende em inglês. NUNCA traduza.`,
-        `3. Em "polished_cues", devolva EXATAMENTE a mesma quantidade de blocos e os mesmos timestamps (startSec/endSec), fazendo apenas correção mínima de pontuação/grafia na fala real transcrita (ou lista vazia se não houver falas).`,
-        `4. Em "highlight_words", liste de 2 a 6 palavras/expressões REAIS que aparecem nas falas acima (no idioma original "${detectedLang}") para destacar conforme o estilo pedido pelo roteirista.`,
-        `5. Em "subtitle_accent_color", escolha "red", "yellow", "green" ou "white" seguindo o pedido do roteirista (padrão "yellow").`,
-        `Retorne APENAS um JSON válido:`,
+        `Retorne APENAS um JSON válido com as decisões VISUAIS de edição:`,
         `{`,
         `  "subtitle_accent_color": "yellow",`,
-        `  "highlight_words": ["..."],`,
+        `  "highlight_words": ["<escolha de 2 a 6 palavras EXATAS que aparecem literalmente nas falas acima no idioma ${detectedLang}>"],`,
         `  "apply_dynamic_zoom": true,`,
         `  "suggested_title": "${(ctx.suggestedTitle ?? '').replace(/"/g, "'")}",`,
-        `  "editing_notes": "<resumo curto do estilo aplicado>",`,
-        `  "polished_cues": [{"startSec": 0, "endSec": 2.5, "text": "<fala real no idioma original>"}]`,
+        `  "editing_notes": "<resumo curto do estilo visual aplicado (cor, zoom, palavras destacadas)>"`,
         `}`,
       ].join('\n\n');
     } else {
       rolePrompt = `Crie um título viral curto (máx 80 caracteres, terminando com #shorts) em português para o Vídeo #${vNum}/${ctx.totalVideos} baseado no tema "${ctx.suggestedTitle ?? ctx.instruction}". Retorne apenas o título.`;
     }
 
-    const invokeAiSdk = async (targetModel: string, includeProviderOpts: boolean) => {
-      const providerModel =
-        req.provider === 'anthropic'
-          ? createAnthropic({ apiKey: req.apiKey })(targetModel)
-          : req.provider === 'google'
-            ? createGoogleGenerativeAI({ apiKey: req.apiKey })(targetModel)
-            : createOpenAI({ apiKey: req.apiKey })(targetModel);
+    const mainRes = await invokeLlmWithRecovery({
+      system: req.systemPrompt,
+      prompt: rolePrompt,
+      maxTokens: effectiveMaxTokens,
+      includeProviderOpts: true,
+    });
 
-      return generateText({
-        model: providerModel,
-        system: req.systemPrompt,
-        prompt: rolePrompt,
-        maxTokens: effectiveMaxTokens,
-        providerOptions: includeProviderOpts
-          ? (buildProviderSpecificOptions(req.provider, targetModel, req.effort) as never)
-          : undefined,
-        abortSignal: ctx.abortSignal,
-      });
-    };
+    const rawText = mainRes.text;
+    if (mainRes.inputTokens > 0) inputTokens = mainRes.inputTokens;
+    if (mainRes.outputTokens > 0) outputTokens = mainRes.outputTokens;
 
-    let rawText = '';
-    try {
-      const llmRes = await invokeAiSdk(resolvedModel, true);
-      rawText = llmRes.text.trim();
-      if (llmRes.usage) {
-        inputTokens = llmRes.usage.promptTokens || inputTokens;
-        outputTokens = llmRes.usage.completionTokens || outputTokens;
-      }
-    } catch (firstErr) {
-      if (ctx.abortSignal?.aborted) {
-        throw new Error('Chamada LLM cancelada pelo usuário.');
-      }
-
-      // Auto-recuperacao para Anthropic Claude 404 (ex: claude-3-5-haiku-latest aposentado em 2026)
-      if (req.provider === 'anthropic' && isNotFound404Error(firstErr)) {
-        const discovery = await discoverActiveAnthropicModel(req.apiKey, resolvedModel);
-        if (discovery.selectedModel) {
-          resolvedModel = discovery.selectedModel;
-          await ctx.emitVisualEvent({
-            type: 'llm.thinking',
-            message: `Modelo ${req.model} retornou 404 na Anthropic; usando modelo ativo "${resolvedModel}".`,
-          });
-          try {
-            const retryRes = await invokeAiSdk(resolvedModel, false);
-            rawText = retryRes.text.trim();
-            if (retryRes.usage) {
-              inputTokens = retryRes.usage.promptTokens || inputTokens;
-              outputTokens = retryRes.usage.completionTokens || outputTokens;
-            }
-          } catch (retryErr) {
-            const detail = extractErrorStatusAndMessage(retryErr);
-            throw new Error(
-              `Anthropic falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
-            );
-          }
-        } else {
-          const detail = extractErrorStatusAndMessage(firstErr);
-          throw new Error(
-            `Anthropic retornou HTTP 404 para "${req.model}" e nenhum modelo Claude ativo foi encontrado nessa chave (${detail.message}).`,
-          );
-        }
-      } else if (req.provider === 'openai' && isNotFound404Error(firstErr)) {
-        const discovery = await discoverActiveOpenAiModel(req.apiKey, resolvedModel);
-        if (discovery.selectedModel) {
-          resolvedModel = discovery.selectedModel;
-          await ctx.emitVisualEvent({
-            type: 'llm.thinking',
-            message: `Modelo ${req.model} retornou 404 na OpenAI; usando modelo ativo "${resolvedModel}".`,
-          });
-          try {
-            const retryRes = await invokeAiSdk(resolvedModel, false);
-            rawText = retryRes.text.trim();
-            if (retryRes.usage) {
-              inputTokens = retryRes.usage.promptTokens || inputTokens;
-              outputTokens = retryRes.usage.completionTokens || outputTokens;
-            }
-          } catch (retryErr) {
-            const detail = extractErrorStatusAndMessage(retryErr);
-            throw new Error(
-              `OpenAI falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
-            );
-          }
-        } else {
-          const detail = extractErrorStatusAndMessage(firstErr);
-          throw new Error(
-            `OpenAI retornou HTTP 404 para "${req.model}" e nenhum modelo GPT ativo foi encontrado nessa chave (${detail.message}).`,
-          );
-        }
-      } else if (req.provider === 'google' && isNotFound404Error(firstErr)) {
-        const discovery = await discoverActiveGoogleGeminiModel(req.apiKey, resolvedModel);
-
-        if (discovery.selectedModel) {
-          resolvedModel = discovery.selectedModel;
-          await ctx.emitVisualEvent({
-            type: 'llm.thinking',
-            message: `Modelo ${req.model} retornou 404 na chave Google AI Studio; usando modelo ativo "${resolvedModel}".`,
-          });
-
-          try {
-            const retryRes = await invokeAiSdk(resolvedModel, false);
-            rawText = retryRes.text.trim();
-            if (retryRes.usage) {
-              inputTokens = retryRes.usage.promptTokens || inputTokens;
-              outputTokens = retryRes.usage.completionTokens || outputTokens;
-            }
-          } catch (retryErr) {
-            const detail = extractErrorStatusAndMessage(retryErr);
-            throw new Error(
-              `Google Gemini falhou com "${req.model}" (404) e também no modelo ativo "${resolvedModel}" (HTTP ${detail.status ?? 'erro'}): ${detail.message}`,
-            );
-          }
-        } else if (req.apiKey.trim().startsWith('AQ.')) {
-          try {
-            const vertexRes = await callVertexExpressGenerateContent({
-              apiKey: req.apiKey,
-              modelId: resolvedModel,
-              systemPrompt: req.systemPrompt,
-              prompt: rolePrompt,
-              maxOutputTokens: effectiveMaxTokens,
-              abortSignal: ctx.abortSignal,
-            });
-            rawText = vertexRes.text;
-            if (vertexRes.inputTokens > 0) inputTokens = vertexRes.inputTokens;
-            if (vertexRes.outputTokens > 0) outputTokens = vertexRes.outputTokens;
-          } catch (vertexErr) {
-            const firstDetail = extractErrorStatusAndMessage(firstErr);
-            const vertexDetail = extractErrorStatusAndMessage(vertexErr);
-            throw new Error(
-              `Google AI Studio retornou HTTP 404 para "${req.model}" (${firstDetail.message}) e Vertex Express também falhou (${vertexDetail.message}). Verifique os modelos ativos na sua chave/projeto no Google AI Studio.`,
-            );
-          }
-        } else {
-          const detail = extractErrorStatusAndMessage(firstErr);
-          throw new Error(
-            `Google AI Studio retornou HTTP 404 para "${req.model}" e nenhum modelo alternativo com generateContent foi encontrado nessa chave (${detail.message}). Verifique se a chave/projeto tem acesso ativo aos modelos Gemini no Google AI Studio.`,
-          );
-        }
-      } else {
-        const detail = extractErrorStatusAndMessage(firstErr);
-        throw new Error(
-          `Falha na chamada ${req.provider.toUpperCase()} (${req.model}) [HTTP ${detail.status ?? 'erro'}]: ${detail.message}`,
-        );
-      }
+    if (!rawText) {
+      throw new Error(
+        `LLM (${req.provider}/${resolvedModel}) retornou resposta vazia — atividade interrompida.`,
+      );
     }
 
-    if (rawText) {
-      if (req.roleSlug === 'scriptwriter') {
-        parsedScriptJson = tryParseJsonFromLlmText<ParsedScriptwriterLlmJson>(rawText);
-      } else if (req.roleSlug === 'video_editor') {
-        parsedEditorJson = tryParseJsonFromLlmText<ParsedVideoEditorLlmJson>(rawText);
-        if (parsedEditorJson?.suggested_title?.trim()) {
-          generatedTitleFallback = parsedEditorJson.suggested_title.trim().slice(0, 95);
-        }
-      } else {
-        generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
+    if (req.roleSlug === 'scriptwriter') {
+      parsedScriptJson = tryParseJsonFromLlmText<ParsedScriptwriterLlmJson>(rawText);
+    } else if (req.roleSlug === 'video_editor') {
+      parsedEditorJson = tryParseJsonFromLlmText<ParsedVideoEditorLlmJson>(rawText);
+      if (parsedEditorJson?.suggested_title?.trim()) {
+        generatedTitleFallback = parsedEditorJson.suggested_title.trim().slice(0, 95);
+      }
+    } else {
+      generatedTitleFallback = rawText.replace(/^["']|["']$/g, '').slice(0, 95);
+      if (generatedTitleFallback && !ctx.suggestedTitle) {
+        ctx.suggestedTitle = generatedTitleFallback;
       }
     }
 
@@ -672,8 +751,15 @@ export async function runRoleWithMultiProviderLlm(
     }
   }
 
-  // 2a fase do Editor: aplica estilo/destaques decididos pelo LLM Editor sobre a FALA REAL transcrita
-  // e executa corte 9:16 + burn-in de legendas reais + upload no Storage!
+  // Publicador executa upload/agendamento SOMENTE APOS a chamada da LLM ter dado certo!
+  if (req.roleSlug === 'publisher_analyst') {
+    await executeRegisteredTool('youtube_upload_short', {}, ctx);
+    await executeRegisteredTool('youtube_schedule_video', {}, ctx);
+    await executeRegisteredTool('youtube_fetch_analytics', {}, ctx);
+  }
+
+  // 2a fase do Editor: aplica EXCLUSIVAMENTE estilo visual (cor, zoom e destaque em palavras que EXISTEM na fala real)
+  // mantendo ctx.spokenSubtitleCues 100% IMUTAVEL (fala verbatim no idioma original) — impossivel vazar instrucoes na legenda!
   if (req.roleSlug === 'video_editor') {
     const allowedColors = new Set(['yellow', 'red', 'white', 'green']);
     const inferredColorFromInstructions = /vermelh|red/i.test(ctx.editingInstructions ?? '')
@@ -682,48 +768,33 @@ export async function runRoleWithMultiProviderLlm(
         ? 'green'
         : 'yellow';
 
+    const spokenTranscriptLower = (ctx.spokenSubtitleCues ?? [])
+      .map((c) => c.text.toLowerCase())
+      .join(' ');
+
+    const verifiedHighlightWords = Array.isArray(parsedEditorJson?.highlight_words)
+      ? parsedEditorJson.highlight_words
+          .map((w) => String(w).trim())
+          .filter(
+            (w) =>
+              w.length >= 2 &&
+              spokenTranscriptLower.includes(w.toLowerCase()),
+          )
+          .slice(0, 8)
+      : [];
+
     ctx.subtitleStyle = {
       accentColor:
         parsedEditorJson?.subtitle_accent_color &&
         allowedColors.has(parsedEditorJson.subtitle_accent_color)
           ? parsedEditorJson.subtitle_accent_color
           : inferredColorFromInstructions,
-      highlightWords: Array.isArray(parsedEditorJson?.highlight_words)
-        ? parsedEditorJson.highlight_words
-            .map((w) => String(w).trim())
-            .filter((w) => w.length >= 2)
-            .slice(0, 8)
-        : [],
+      highlightWords: verifiedHighlightWords,
       applyDynamicZoom:
         typeof parsedEditorJson?.apply_dynamic_zoom === 'boolean'
           ? parsedEditorJson.apply_dynamic_zoom
           : /zoom/i.test(ctx.editingInstructions ?? ''),
     };
-
-    // Aceita polished_cues SOMENTE se mantiver o mesmo numero de blocos e nao vazar instrucoes de edicao!
-    const origCues = ctx.spokenSubtitleCues ?? [];
-    const candidatePolished = parsedEditorJson?.polished_cues;
-    if (
-      origCues.length > 0 &&
-      Array.isArray(candidatePolished) &&
-      candidatePolished.length === origCues.length
-    ) {
-      const directorLeakPattern =
-        /abra com zoom|cortes din[aâ]micos|destaque em vermelho|ritmo acelerado|transi[cç][õo]es de/i;
-      const allClean = candidatePolished.every(
-        (c) =>
-          typeof c.text === 'string' &&
-          c.text.trim().length > 0 &&
-          !directorLeakPattern.test(c.text),
-      );
-      if (allClean) {
-        ctx.spokenSubtitleCues = origCues.map((orig, idx) => ({
-          startSec: orig.startSec,
-          endSec: orig.endSec,
-          text: candidatePolished[idx]!.text.trim(),
-        }));
-      }
-    }
 
     await executeRegisteredTool('cut_vertical_short', {}, ctx);
     await executeRegisteredTool('burn_subtitles', {}, ctx);
@@ -782,14 +853,33 @@ export async function runRoleWithMultiProviderLlm(
         ? `Você viu esse momento de "${ctx.sourceVideoTitle.slice(0, 65)}"?`
         : `O momento mais insano desse vídeo!`);
 
+    const finalSeoTags =
+      Array.isArray(parsedScriptJson?.seo_tags) && parsedScriptJson.seo_tags.length > 0
+        ? parsedScriptJson.seo_tags
+            .map((t) => String(t).replace(/^#/, '').trim())
+            .filter((t) => t.length >= 2)
+            .slice(0, 15)
+        : ['shorts', 'youtube shorts', 'viral', ctx.sourceChannelName ?? 'youtube'].filter(Boolean);
+
+    const finalSeoDescription =
+      parsedScriptJson?.seo_description?.trim() ||
+      `${finalHook}\n\nTrecho em destaque de "${ctx.sourceVideoTitle ?? ctx.instruction}" (${ctx.sourceChannelName ?? 'YouTube'}).\n\n${finalSeoTags
+        .slice(0, 5)
+        .map((t) => `#${t.replace(/\s+/g, '')}`)
+        .join(' ')} #shorts`;
+
+    const finalSubtitleInstructions =
+      parsedScriptJson?.subtitle_instructions?.trim() ||
+      'Aplicar legendas dinâmicas na fala real no idioma original do vídeo, destacando palavras-chave de impacto em amarelo vibrante e usando zoom sutil na abertura.';
+
     const finalRationale =
       parsedScriptJson?.rationale?.trim() ||
-      `Corte vertical 9:16 extraído de "${ctx.sourceVideoTitle ?? finalSourceUrl}" (${ctx.sourceChannelName ?? 'YouTube'}) entre ${rawStart}s e ${finalEndSec}s. Destacar o gancho inicial nos 3 primeiros segundos, aplicar cortes dinâmicos e queimar legendas amarelas sincronizadas.`;
+      `Trecho de maior interesse extraído de "${ctx.sourceVideoTitle ?? finalSourceUrl}" (${ctx.sourceChannelName ?? 'YouTube'}) entre ${rawStart}s e ${finalEndSec}s.`;
 
     const finalScore =
       typeof parsedScriptJson?.score === 'number' &&
-        parsedScriptJson.score >= 0 &&
-        parsedScriptJson.score <= 100
+      parsedScriptJson.score >= 0 &&
+      parsedScriptJson.score <= 100
         ? Math.round(parsedScriptJson.score)
         : Math.min(99, 89 + (vNum % 10));
 
@@ -801,6 +891,9 @@ export async function runRoleWithMultiProviderLlm(
           end_sec: finalEndSec,
           hook: finalHook,
           suggested_title: finalTitle,
+          seo_description: finalSeoDescription,
+          seo_tags: finalSeoTags,
+          subtitle_instructions: finalSubtitleInstructions,
           rationale: finalRationale,
           score: finalScore,
         },
@@ -809,9 +902,9 @@ export async function runRoleWithMultiProviderLlm(
   } else if (req.roleSlug === 'video_editor') {
     const finalDuration =
       ctx.startSec !== undefined &&
-        ctx.endSec !== undefined &&
-        ctx.endSec > ctx.startSec &&
-        ctx.endSec - ctx.startSec <= 60
+      ctx.endSec !== undefined &&
+      ctx.endSec > ctx.startSec &&
+      ctx.endSec - ctx.startSec <= 60
         ? ctx.endSec - ctx.startSec
         : 45;
     rawOutput = {
@@ -825,6 +918,8 @@ export async function runRoleWithMultiProviderLlm(
             ctx.suggestedTitle ??
             generatedTitleFallback ??
             `Short #${vNum}/${ctx.totalVideos} #shorts`,
+          ...(ctx.seoDescription ? { seo_description: ctx.seoDescription } : {}),
+          ...(ctx.seoTags && ctx.seoTags.length > 0 ? { seo_tags: ctx.seoTags } : {}),
         },
       ],
     };
@@ -845,7 +940,7 @@ export async function runRoleWithMultiProviderLlm(
             ctx.suggestedTitle ??
             generatedTitleFallback ??
             `Short #${vNum}/${ctx.totalVideos} #shorts`,
-          visibility: uploaded?.visibility ?? 'private',
+          visibility: uploaded?.visibility ?? 'public',
           publication_status: uploaded?.publicationStatus ?? pubPlan.publicationStatus,
           scheduled_at: uploaded?.scheduledAt ?? pubPlan.scheduledAtIso,
           quota_units_consumed: uploaded?.quotaUnitsConsumed ?? pubPlan.quotaUnitsConsumed,

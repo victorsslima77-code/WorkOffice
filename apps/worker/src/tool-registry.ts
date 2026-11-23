@@ -64,6 +64,8 @@ export interface ToolExecutionContext {
   llmProvider?: LlmProvider;
   llmApiKey?: string;
   suggestedTitle?: string;
+  seoDescription?: string;
+  seoTags?: string[];
   hookText?: string;
   startSec?: number;
   endSec?: number;
@@ -409,10 +411,12 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         videoIndex: ctx.videoIndex,
         title: ctx.suggestedTitle ?? `Vídeo #${ctx.videoIndex}/${ctx.totalVideos} — ${ctx.instruction}`,
         description:
-          ctx.hookText
-            ? `${ctx.hookText}\n\nProduzido automaticamente pelo WorkOffice #shorts`
-            : `Short produzido e publicado automaticamente pelo WorkOffice: ${ctx.instruction} #shorts`,
-        visibility: 'private',
+          ctx.seoDescription?.trim() ||
+          (ctx.hookText
+            ? `${ctx.hookText}\n\n#shorts`
+            : `Short produzido pelo WorkOffice: ${ctx.instruction} #shorts`),
+        tags: ctx.seoTags,
+        visibility: 'public',
         oauth: ctx.youtubeOAuth,
         supabaseStorageClient: ctx.supabaseStorageClient,
         allowSandboxFallback: Boolean(ctx.isSandbox),

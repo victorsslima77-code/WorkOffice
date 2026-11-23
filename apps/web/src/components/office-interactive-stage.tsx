@@ -25,6 +25,7 @@ import {
   ArtifactPreviewModal,
   type PreviewableArtifact,
 } from './artifact-preview-modal';
+import { InteractiveJsonViewer } from './interactive-json-viewer';
 import OfficeGameCanvas, {
   type ActiveAgentVisualState,
   type CanvasVisualCommand,
@@ -120,6 +121,7 @@ export function OfficeInteractiveStage({
   const [previewArtifact, setPreviewArtifact] = useState<PreviewableArtifact | null>(null);
   const [deskModalSlot, setDeskModalSlot] = useState<DeskSlot | null>(null);
   const [shelfModalSlot, setShelfModalSlot] = useState<DeskSlot | null>(null);
+  const [shelfModalTab, setShelfModalTab] = useState<'inbox' | 'outbox'>('inbox');
   const [activityDetailModalItem, setActivityDetailModalItem] = useState<
     FeedEventItem | 'all_agent_logs' | null
   >(null);
@@ -1446,26 +1448,25 @@ export function OfficeInteractiveStage({
         </div>
       )}
 
-      {/* MODAL 2: Estante da Sala (Caixa de Entrada e Caixa de Saida Detalhadas) */}
+      {/* MODAL 2: Estante da Sala (Menu de Tabs Caixa de Entrada / Caixa de Saida + JSON Interativo) */}
       {shelfModalSlot && shelfModalAgent && (
         <div
           role="dialog"
           aria-modal="true"
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
         >
-          <div className="max-h-[90vh] w-full max-w-4xl overflow-y-auto border-2 border-amber-500 bg-slate-900 p-6 shadow-[8px_8px_0px_0px_rgba(245,158,11,0.28)]">
+          <div className="flex max-h-[90vh] w-full max-w-4xl flex-col border-2 border-amber-500 bg-slate-900 p-6 shadow-[8px_8px_0px_0px_rgba(245,158,11,0.28)]">
             <div className="mb-4 flex items-start justify-between border-b border-slate-800 pb-3">
               <div>
                 <span className="text-[10px] font-bold uppercase tracking-widest text-amber-400">
                   📚 Estante da Sala // {shelfModalAgent.deskSlot.toUpperCase()}
                 </span>
                 <h3 className="text-lg font-bold text-white">
-                  Caixa de Entrada &amp; Caixa de Saída Detalhadas — {shelfModalAgent.name} (
-                  {shelfModalAgent.roleName})
+                  Estante de Artefatos — {shelfModalAgent.name} ({shelfModalAgent.roleName})
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Inspecione todos os artefatos depositados na estante desta sala e os outputs
-                  produzidos por este funcionário.
+                  Alterne entre Caixa de Entrada e Caixa de Saída para inspecionar os payloads JSON
+                  e baixar os arquivos produzidos.
                 </p>
               </div>
               <button
@@ -1477,94 +1478,143 @@ export function OfficeInteractiveStage({
               </button>
             </div>
 
-            <div className="grid gap-4 text-xs lg:grid-cols-2">
-              {/* Coluna 1: Caixa de Entrada Detalhada */}
-              <div className="border border-slate-800 bg-slate-950 p-4">
-                <div className="mb-3 flex items-center justify-between border-b border-slate-800 pb-2">
-                  <span className="font-bold uppercase tracking-wider text-amber-300">
-                    📥 Caixa de Entrada na Estante ({shelfModalInbox.length})
-                  </span>
-                  <span className="text-[10px] text-slate-400">Inputs recebidos na sala</span>
-                </div>
+            {/* Menu de Tabs (substitui o layout 50/50 para leitura em largura total) */}
+            <div
+              role="tablist"
+              aria-label="Caixas da Estante"
+              className="mb-4 flex flex-wrap gap-2 border-b border-slate-800 pb-3 text-xs"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={shelfModalTab === 'inbox'}
+                onClick={() => setShelfModalTab('inbox')}
+                className={`flex items-center gap-2 border-2 px-4 py-2 font-bold uppercase tracking-wider transition-colors ${
+                  shelfModalTab === 'inbox'
+                    ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                    : 'border-slate-700 bg-slate-950 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+                }`}
+              >
+                <span>📥 Caixa de Entrada</span>
+                <span className="rounded border border-current/40 px-1.5 py-0 text-[10px]">
+                  {shelfModalInbox.length}
+                </span>
+              </button>
 
-                {shelfModalInbox.length === 0 ? (
-                  <div className="border border-dashed border-slate-800 p-6 text-center text-slate-500">
-                    Nenhum item na Caixa de Entrada desta estante no momento.
+              <button
+                type="button"
+                role="tab"
+                aria-selected={shelfModalTab === 'outbox'}
+                onClick={() => setShelfModalTab('outbox')}
+                className={`flex items-center gap-2 border-2 px-4 py-2 font-bold uppercase tracking-wider transition-colors ${
+                  shelfModalTab === 'outbox'
+                    ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300'
+                    : 'border-slate-700 bg-slate-950 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+                }`}
+              >
+                <span>📤 Caixa de Saída</span>
+                <span className="rounded border border-current/40 px-1.5 py-0 text-[10px]">
+                  {shelfModalOutbox.length}
+                </span>
+              </button>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto pr-1 text-xs">
+              {shelfModalTab === 'inbox' ? (
+                <div className="border border-slate-800 bg-slate-950 p-4">
+                  <div className="mb-3 flex items-center justify-between border-b border-slate-800 pb-2">
+                    <span className="font-bold uppercase tracking-wider text-amber-300">
+                      📥 Caixa de Entrada na Estante ({shelfModalInbox.length})
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Inputs recebidos nesta sala
+                    </span>
                   </div>
-                ) : (
-                  <div className="max-h-96 space-y-2.5 overflow-y-auto pr-1">
-                    {shelfModalInbox.map((art) => (
-                      <div key={art.id} className="border border-slate-800 bg-slate-900 p-3">
-                        <div className="flex items-start justify-between gap-2">
-                          <div>
-                            <div className="font-bold text-amber-200">{art.title}</div>
-                            <div className="text-[10px] text-slate-400">
-                              {art.fromOrTo} • {art.timestamp} • Tipo:{' '}
-                              <code className="text-amber-300">{art.kind}</code>
+
+                  {shelfModalInbox.length === 0 ? (
+                    <div className="border border-dashed border-slate-800 p-8 text-center text-slate-500">
+                      Nenhum item na Caixa de Entrada desta estante no momento.
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {shelfModalInbox.map((art) => (
+                        <div key={art.id} className="border border-slate-800 bg-slate-900 p-3.5">
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <div className="text-sm font-bold text-amber-200">{art.title}</div>
+                              <div className="text-[10px] text-slate-400">
+                                {art.fromOrTo} • {art.timestamp} • Tipo:{' '}
+                                <code className="text-amber-300">{art.kind}</code>
+                              </div>
                             </div>
+                            <button
+                              type="button"
+                              onClick={() => setPreviewArtifact(art)}
+                              className="shrink-0 border border-amber-400/70 bg-amber-500/20 px-2.5 py-1 text-[10px] font-bold uppercase text-amber-300 hover:border-amber-400"
+                            >
+                              Ver / Baixar
+                            </button>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => setPreviewArtifact(art)}
-                            className="shrink-0 border border-amber-400/70 bg-amber-500/20 px-2.5 py-1 text-[10px] font-bold uppercase text-amber-300 hover:border-amber-400"
-                          >
-                            Ver / Baixar
-                          </button>
+                          {art.metadata && (
+                            <InteractiveJsonViewer
+                              data={art.metadata}
+                              initialExpandDepth={3}
+                              maxHeightClassName="max-h-80"
+                            />
+                          )}
                         </div>
-                        {art.metadata && (
-                          <pre className="mt-2 max-h-28 overflow-auto border border-slate-800 bg-slate-950 p-2 font-mono text-[10px] text-slate-300">
-                            {JSON.stringify(art.metadata, null, 2)}
-                          </pre>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Coluna 2: Caixa de Saida Detalhada */}
-              <div className="border border-slate-800 bg-slate-950 p-4">
-                <div className="mb-3 flex items-center justify-between border-b border-slate-800 pb-2">
-                  <span className="font-bold uppercase tracking-wider text-emerald-400">
-                    📤 Caixa de Saída Detalhada ({shelfModalOutbox.length})
-                  </span>
-                  <span className="text-[10px] text-slate-400">Artefatos produzidos e entregues</span>
+                      ))}
+                    </div>
+                  )}
                 </div>
+              ) : (
+                <div className="border border-slate-800 bg-slate-950 p-4">
+                  <div className="mb-3 flex items-center justify-between border-b border-slate-800 pb-2">
+                    <span className="font-bold uppercase tracking-wider text-emerald-400">
+                      📤 Caixa de Saída Detalhada ({shelfModalOutbox.length})
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Artefatos produzidos e entregues por este agente
+                    </span>
+                  </div>
 
-                {shelfModalOutbox.length === 0 ? (
-                  <div className="border border-dashed border-slate-800 p-6 text-center text-slate-500">
-                    Nenhum artefato produzido na Caixa de Saída desta sala ainda.
-                  </div>
-                ) : (
-                  <div className="max-h-96 space-y-2.5 overflow-y-auto pr-1">
-                    {shelfModalOutbox.map((art) => (
-                      <div key={art.id} className="border border-slate-800 bg-slate-900 p-3">
-                        <div className="flex items-start justify-between gap-2">
-                          <div>
-                            <div className="font-bold text-emerald-300">{art.title}</div>
-                            <div className="text-[10px] text-slate-400">
-                              {art.fromOrTo} • {art.timestamp} • Tipo:{' '}
-                              <code className="text-emerald-300">{art.kind}</code>
+                  {shelfModalOutbox.length === 0 ? (
+                    <div className="border border-dashed border-slate-800 p-8 text-center text-slate-500">
+                      Nenhum artefato produzido na Caixa de Saída desta sala ainda.
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {shelfModalOutbox.map((art) => (
+                        <div key={art.id} className="border border-slate-800 bg-slate-900 p-3.5">
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <div className="text-sm font-bold text-emerald-300">{art.title}</div>
+                              <div className="text-[10px] text-slate-400">
+                                {art.fromOrTo} • {art.timestamp} • Tipo:{' '}
+                                <code className="text-emerald-300">{art.kind}</code>
+                              </div>
                             </div>
+                            <button
+                              type="button"
+                              onClick={() => setPreviewArtifact(art)}
+                              className="shrink-0 border border-emerald-400/70 bg-emerald-500/20 px-2.5 py-1 text-[10px] font-bold uppercase text-emerald-300 hover:border-emerald-400"
+                            >
+                              ⬇ Preview / Baixar
+                            </button>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => setPreviewArtifact(art)}
-                            className="shrink-0 border border-emerald-400/70 bg-emerald-500/20 px-2.5 py-1 text-[10px] font-bold uppercase text-emerald-300 hover:border-emerald-400"
-                          >
-                            ⬇ Preview / Baixar
-                          </button>
+                          {art.metadata && (
+                            <InteractiveJsonViewer
+                              data={art.metadata}
+                              initialExpandDepth={3}
+                              maxHeightClassName="max-h-80"
+                            />
+                          )}
                         </div>
-                        {art.metadata && (
-                          <pre className="mt-2 max-h-28 overflow-auto border border-slate-800 bg-slate-950 p-2 font-mono text-[10px] text-emerald-200">
-                            {JSON.stringify(art.metadata, null, 2)}
-                          </pre>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="mt-5 flex justify-end border-t border-slate-800 pt-3">
@@ -1733,9 +1783,11 @@ export function OfficeInteractiveStage({
                           <div className="mb-1 font-mono text-[11px] text-emerald-300">
                             Task #{tk.id} • Status: {tk.status}
                           </div>
-                          <pre className="max-h-32 overflow-auto border border-slate-900 bg-slate-900 p-2 font-mono text-[10px] text-slate-300">
-                            {JSON.stringify({ input: tk.input, output: tk.output }, null, 2)}
-                          </pre>
+                          <InteractiveJsonViewer
+                            data={{ input: tk.input, output: tk.output }}
+                            initialExpandDepth={2}
+                            maxHeightClassName="max-h-56"
+                          />
                         </div>
                       ))}
                   </div>
@@ -1937,7 +1989,13 @@ export function OfficeInteractiveStage({
             selectedAgentId={selectedAgentId}
             onSelectAgent={(id) => setSelectedAgentId(id)}
             onClickDesk={(slot) => setDeskModalSlot(slot)}
-            onClickShelf={(slot) => setShelfModalSlot(slot)}
+            onClickShelf={(slot) => {
+              setShelfModalSlot(slot);
+              const ag = agents.find((a) => a.deskSlot === slot);
+              const hasIn = ag ? (inboxByAgent[ag.id]?.length ?? 0) > 0 : false;
+              const hasOut = ag ? (outboxByAgent[ag.id]?.length ?? 0) > 0 : false;
+              setShelfModalTab(!hasIn && hasOut ? 'outbox' : 'inbox');
+            }}
             playbackSpeed={playbackSpeed}
           />
         </div>

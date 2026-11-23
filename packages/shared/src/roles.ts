@@ -38,6 +38,9 @@ export const CandidateClipSchema = z
     end_sec: z.number().min(5),
     hook: z.string().min(3),
     suggested_title: z.string().min(3).max(100),
+    seo_description: z.string().min(5).max(5000).optional(),
+    seo_tags: z.array(z.string().min(1).max(60)).max(20).optional(),
+    subtitle_instructions: z.string().min(3).optional(),
     rationale: z.string().min(5),
     score: z.number().min(0).max(100),
   })
@@ -62,6 +65,8 @@ export const EditedShortItemSchema = z.object({
   duration_sec: z.number().positive().max(60),
   resolution: z.literal('1080x1920').or(z.string().min(3)),
   suggested_title: z.string().min(3).max(100),
+  seo_description: z.string().max(5000).optional(),
+  seo_tags: z.array(z.string().min(1).max(60)).max(20).optional(),
 });
 export type EditedShortItem = z.infer<typeof EditedShortItemSchema>;
 
@@ -73,7 +78,7 @@ export type VideoEditorOutput = z.infer<typeof VideoEditorOutputSchema>;
 // 3. Publicador / Analista (publisher_analyst)
 export const PublisherAnalystInputSchema = z.object({
   edited_shorts: z.array(EditedShortItemSchema).min(1),
-  publish_visibility: z.enum(['private', 'unlisted', 'public']).default('private'),
+  publish_visibility: z.enum(['private', 'unlisted', 'public']).default('public'),
 });
 export type PublisherAnalystInput = z.infer<typeof PublisherAnalystInputSchema>;
 
@@ -329,12 +334,12 @@ export const YOUTUBE_SHORTS_ROLES: readonly OfficeRoleDefinition[] = [
     allowedTools: ['web_search', 'youtube_list_videos', 'fetch_transcript', 'read_source'],
     workstationType: 'research_desk',
     scope:
-      'Pesquisar conteúdos em alta sobre o tema pedido e gerar 1 instrução clara de edição por vez para cada vídeo solicitado, depositando na estante do Editor (shelf_2).',
+      'Procurar os vídeos mais em alta sobre o assunto pedido, definir as melhores tags de SEO, descrição SEO, o ponto de maior interesse para corte (<=60s) e orientações de legenda para o Editor, depositando na estante do Editor (shelf_2).',
     systemPrompt:
-      'Você é o Roteirista e Pesquisador de Shorts do WorkOffice (Baia 1). Você só inicia atividades ao receber uma instrução do usuário (ex.: "Crie 10 vídeos do vídeo game novo"). Para cada vídeo solicitado (1 a N), produza 1 documento claro de instruções de edição contendo: URL de origem validada, timestamp inicial e final (máx. 60s), gancho de abertura de alta retenção nos 3 primeiros segundos, roteiro de legenda e título SEO com #shorts. Entregue cada instrução individualmente na estante do Editor (Baia 2) e retorne imediatamente à sua mesa para produzir o próximo vídeo em paralelo.',
+      'Você é o Roteirista e Pesquisador de Shorts do WorkOffice (Baia 1). Você só inicia atividades ao receber uma instrução do usuário. Para cada vídeo solicitado (1 a N): (1) procure os vídeos mais em alta e com maior engajamento/visualizações sobre o assunto solicitado; (2) escolha o ponto exato de maior interesse para cortar (start_sec e end_sec, duração de 25s a 58s); (3) defina título SEO viral com #shorts, as melhores tags de SEO (seo_tags) e uma descrição SEO completa (seo_description); (4) escreva orientações claras de estilo visual de legenda para o Editor (subtitle_instructions — cores de destaque, palavras-chave e ritmo, lembrando que a legenda do vídeo deve transcrever a fala real no idioma original). Entregue cada documento individualmente na estante do Editor (Baia 2).',
     inputContractSummary: 'Instrução do usuário (tema + quantidade N de vídeos a produzir).',
     outputContractSummary:
-      '1 documento JSON de instrução clara de edição por vez (source_url, start_sec, end_sec <= 60s, hook, suggested_title, rationale, score) entregue na estante da Baia 2.',
+      '1 documento JSON de instrução de edição por vez (source_url em alta, start_sec, end_sec <= 60s, suggested_title, seo_description, seo_tags, subtitle_instructions, hook, rationale, score) entregue na estante da Baia 2.',
   },
   {
     slug: 'video_editor',
@@ -368,7 +373,7 @@ export const YOUTUBE_SHORTS_ROLES: readonly OfficeRoleDefinition[] = [
     scope:
       'Retirar 1 vídeo editado por vez na sua estante (shelf_3), manter a periodicidade máxima respeitando a cota diária do YouTube (máx. 6 vídeos/dia, janela de 4h), publicar ou agendar excedentes e emitir a URL do Short ou o detalhe do agendamento.',
     systemPrompt:
-      'Você é o Publicador e Analista de Shorts do WorkOffice (Baia 3). Permaneça descansando na copa até receber um vídeo editado na sua estante (shelf_3). Ao retirar o vídeo da estante, verifique a cota diária da YouTube Data API v3 (10.000 unidades/dia ÷ 1.600 unidades/upload = máximo de 6 vídeos publicados por dia, espaçados a cada 4 horas). Para vídeos dentro da cota diária (1 a 6), publique o Short e retorne a URL do Short publicado. Se produzirem mais vídeos do que a cota diária (7 em diante), agende automaticamente a publicação para as próximas janelas diárias e retorne o detalhe completo do agendamento (schedule_details).',
+      'Você é o Publicador e Analista de Shorts do WorkOffice (Baia 3). Permaneça descansando na copa até receber um vídeo editado na sua estante (shelf_3). Ao retirar o vídeo da estante, verifique a cota diária da YouTube Data API v3 (10.000 unidades/dia ÷ 1.600 unidades/upload = máximo de 6 vídeos publicados por dia, espaçados a cada 4 horas). Para vídeos dentro da cota diária (1 a 6), publique o Short diretamente como PÚBLICO aplicando o título, descrição SEO e tags SEO definidas pelo Roteirista, e retorne a URL do Short publicado. Se produzirem mais vídeos do que a cota diária (7 em diante), agende automaticamente a publicação para as próximas janelas diárias e retorne o detalhe completo do agendamento (schedule_details).',
     inputContractSummary:
       '1 vídeo Short vertical editado e legendado (edited_short) retirado da sua estante (shelf_3).',
     outputContractSummary:

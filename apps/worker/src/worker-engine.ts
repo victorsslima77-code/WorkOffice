@@ -260,11 +260,16 @@ export async function processQueuedAgentTask(
         start_sec?: number;
         end_sec?: number;
         suggested_title?: string;
+        seo_description?: string;
+        seo_tags?: string[];
+        subtitle_instructions?: string;
         hook?: string;
         rationale?: string;
       }[];
       edited_shorts?: {
         suggested_title?: string;
+        seo_description?: string;
+        seo_tags?: string[];
         storage_path?: string;
       }[];
     };
@@ -285,8 +290,10 @@ export async function processQueuedAgentTask(
       startSec: firstClip?.start_sec,
       endSec: firstClip?.end_sec,
       suggestedTitle: firstEdited?.suggested_title ?? firstClip?.suggested_title,
+      seoDescription: firstEdited?.seo_description ?? firstClip?.seo_description,
+      seoTags: firstEdited?.seo_tags ?? firstClip?.seo_tags,
       hookText: firstClip?.hook,
-      editingInstructions: firstClip?.rationale,
+      editingInstructions: firstClip?.subtitle_instructions ?? firstClip?.rationale,
       llmProvider: agent.provider,
       llmApiKey: apiKey,
       youtubeOAuth,

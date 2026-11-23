@@ -38,7 +38,29 @@ export interface CandidatePodcastVideo {
   channelTitle: string;
   publishedAt: string;
   durationSec: number;
+  viewCount?: number;
   description?: string;
+}
+
+function parseViewCountText(text?: string): number {
+  if (!text) return 0;
+  const cleaned = text.toLowerCase().replace(/\u00a0/g, ' ').trim();
+  const numMatch = cleaned.match(/([\d.,]+)\s*(mi|mil|k|m|b)?/);
+  if (!numMatch?.[1]) return 0;
+  let numStr = numMatch[1];
+  const suffix = numMatch[2] ?? '';
+  if (suffix) {
+    numStr = numStr.replace(',', '.');
+    const base = Number(numStr);
+    if (Number.isNaN(base)) return 0;
+    if (suffix === 'b') return Math.round(base * 1_000_000_000);
+    if (suffix === 'mi' || suffix === 'm') return Math.round(base * 1_000_000);
+    if (suffix === 'mil' || suffix === 'k') return Math.round(base * 1_000);
+    return Math.round(base);
+  }
+  const digitsOnly = numStr.replace(/[.,]/g, '');
+  const parsed = Number(digitsOnly);
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
 /**
@@ -86,31 +108,43 @@ export async function searchRealYoutubeVideosViaDataApi(
     const tokenInfo = await exchangeYoutubeRefreshToken(oauth);
     if (tokenInfo.isSandbox) return [];
 
-    const url = `https://www.googleapis.com/youtube/v3/search?${new URLSearchParams({
-      part: 'snippet',
-      type: 'video',
-      maxResults: String(Math.min(10, Math.max(1, maxResults))),
-      order: 'relevance',
-      relevanceLanguage: 'pt',
-      q: cleanQuery,
-    }).toString()}`;
+    const sixMonthsAgoIso = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString();
+    const buildSearchUrl = (order: 'viewCount' | 'relevance', withRecency: boolean) =>
+      `https://www.googleapis.com/youtube/v3/search?${new URLSearchParams({
+        part: 'snippet',
+        type: 'video',
+        maxResults: String(Math.min(10, Math.max(1, maxResults))),
+        order,
+        relevanceLanguage: 'pt',
+        ...(withRecency ? { publishedAfter: sixMonthsAgoIso } : {}),
+        q: cleanQuery,
+      }).toString()}`;
 
-    const res = await fetch(url, {
+    // Prioriza videos mais em alta (maior numero de visualizacoes nos ultimos 6 meses)
+    let res = await fetch(buildSearchUrl('viewCount', true), {
       headers: { Authorization: `Bearer ${tokenInfo.accessToken}` },
     });
-    if (!res.ok) return [];
+    let data = res.ok
+      ? ((await res.json()) as {
+          items?: {
+            id?: { videoId?: string };
+            snippet?: {
+              title?: string;
+              channelTitle?: string;
+              description?: string;
+              publishedAt?: string;
+            };
+          }[];
+        })
+      : { items: [] };
 
-    const data = (await res.json()) as {
-      items?: {
-        id?: { videoId?: string };
-        snippet?: {
-          title?: string;
-          channelTitle?: string;
-          description?: string;
-          publishedAt?: string;
-        };
-      }[];
-    };
+    if (!data.items || data.items.length === 0) {
+      res = await fetch(buildSearchUrl('viewCount', false), {
+        headers: { Authorization: `Bearer ${tokenInfo.accessToken}` },
+      });
+      if (!res.ok) return [];
+      data = (await res.json()) as typeof data;
+    }
 
     const results: CandidatePodcastVideo[] = [];
     for (const item of data.items ?? []) {
@@ -125,6 +159,30 @@ export async function searchRealYoutubeVideosViaDataApi(
           durationSec: 600,
           description: item.snippet?.description ?? '',
         });
+      }
+    }
+
+    // Enriquece com viewCount real via videos.list (custo minimo: 1 unidade) e ordena pelos mais em alta
+    if (results.length > 0) {
+      try {
+        const statsRes = await fetch(
+          `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${encodeURIComponent(results.map((r) => r.videoId).join(','))}`,
+          { headers: { Authorization: `Bearer ${tokenInfo.accessToken}` } },
+        );
+        if (statsRes.ok) {
+          const statsData = (await statsRes.json()) as {
+            items?: { id?: string; statistics?: { viewCount?: string } }[];
+          };
+          const viewsById = new Map(
+            (statsData.items ?? []).map((it) => [it.id ?? '', Number(it.statistics?.viewCount ?? 0)]),
+          );
+          for (const r of results) {
+            r.viewCount = viewsById.get(r.videoId) ?? 0;
+          }
+          results.sort((a, b) => (b.viewCount ?? 0) - (a.viewCount ?? 0));
+        }
+      } catch {
+        // Mantem ordem original retornada pelo order=viewCount
       }
     }
     return results;
@@ -172,6 +230,8 @@ export async function searchRealYoutubeVideosViaHtml(
                       title?: { runs?: { text?: string }[] };
                       ownerText?: { runs?: { text?: string }[] };
                       lengthText?: { simpleText?: string };
+                      viewCountText?: { simpleText?: string; runs?: { text?: string }[] };
+                      shortViewCountText?: { simpleText?: string };
                       detailedMetadataSnippets?: {
                         snippetText?: { runs?: { text?: string }[] };
                       }[];
@@ -200,12 +260,17 @@ export async function searchRealYoutubeVideosViaHtml(
 
         const channelTitle = vr.ownerText?.runs?.[0]?.text ?? 'YouTube';
         const durationSec = parseDurationTextToSec(vr.lengthText?.simpleText);
+        const viewText =
+          vr.viewCountText?.simpleText ??
+          vr.viewCountText?.runs?.map((r) => r.text ?? '').join('') ??
+          vr.shortViewCountText?.simpleText;
+        const viewCount = parseViewCountText(viewText);
         const snippetDesc =
           vr.detailedMetadataSnippets?.[0]?.snippetText?.runs
             ?.map((r) => r.text ?? '')
             .join('') ?? '';
 
-        // Prioriza videos com pelo menos 60s para permitir cortes reais de Shorts
+        // Prioriza videos com pelo menos 55s para permitir cortes reais de Shorts
         if (durationSec >= 55) {
           results.push({
             videoId: vr.videoId,
@@ -214,16 +279,19 @@ export async function searchRealYoutubeVideosViaHtml(
             channelTitle,
             publishedAt: new Date().toISOString(),
             durationSec,
+            viewCount,
             description: snippetDesc,
           });
         }
 
-        if (results.length >= maxResults) break;
+        if (results.length >= Math.max(maxResults * 2, 12)) break;
       }
-      if (results.length >= maxResults) break;
+      if (results.length >= Math.max(maxResults * 2, 12)) break;
     }
 
-    return results;
+    // Ordena pelos videos mais em alta (maior numero de visualizacoes) sobre o tema
+    results.sort((a, b) => (b.viewCount ?? 0) - (a.viewCount ?? 0));
+    return results.slice(0, maxResults);
   } catch {
     return [];
   }
@@ -264,6 +332,7 @@ export async function searchRealYoutubeVideosWithYtDlp(
           channel?: string;
           uploader?: string;
           duration?: number;
+          view_count?: number;
           description?: string;
         };
         if (item.id && /^[a-zA-Z0-9_-]{11}$/.test(item.id)) {
@@ -274,6 +343,7 @@ export async function searchRealYoutubeVideosWithYtDlp(
             channelTitle: item.channel ?? item.uploader ?? 'YouTube',
             publishedAt: new Date().toISOString(),
             durationSec: Number(item.duration ?? 600),
+            viewCount: Number(item.view_count ?? 0),
             description: item.description ?? '',
           });
         }
@@ -282,6 +352,7 @@ export async function searchRealYoutubeVideosWithYtDlp(
       }
     }
 
+    results.sort((a, b) => (b.viewCount ?? 0) - (a.viewCount ?? 0));
     return results;
   } catch {
     return [];
