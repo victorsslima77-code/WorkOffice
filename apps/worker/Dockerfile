@@ -17,10 +17,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && chmod a+rx /usr/local/bin/yt-dlp \
   && rm -rf /var/lib/apt/lists/*
 
-# Ambiente Python isolado com faster-whisper (best-effort binary wheels; fallback automatico para yt-dlp subs + Cloud STT)
+# Ambiente Python isolado com yt-dlp[default,curl-cffi] (yt-dlp-ejs + TLS impersonation) + faster-whisper
 RUN python3 -m venv /opt/venv \
-  && (/opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-      && /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: faster-whisper \
+  && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+  && (/opt/venv/bin/pip install --no-cache-dir --upgrade "yt-dlp[default,curl-cffi]" \
+      || /opt/venv/bin/pip install --no-cache-dir --upgrade "yt-dlp[default]") \
+  && (/opt/venv/bin/pip install --no-cache-dir --only-binary=:all: faster-whisper \
       || echo "[Dockerfile] faster-whisper wheel indisponivel; seguindo com yt-dlp subs + Cloud STT")
 ENV PATH="/opt/venv/bin:$PATH"
 ENV HF_HOME="/app/.whisper-cache"

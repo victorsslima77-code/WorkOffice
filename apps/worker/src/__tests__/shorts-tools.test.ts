@@ -68,7 +68,21 @@ describe('@workoffice/worker — Etapa 6 (Tools Reais de Pesquisa, Edicao 9:16/S
     expect(ytdlpArgs).toContain('--download-sections');
     expect(ytdlpArgs).toContain('*120-172');
     expect(ytdlpArgs).toContain('--merge-output-format');
-    expect(ytdlpArgs.join(' ')).toContain('ios,mweb');
+    expect(ytdlpArgs).toContain('--js-runtimes');
+    expect(ytdlpArgs).toContain('node');
+    expect(ytdlpArgs).not.toContain('--extractor-args');
+
+    const customYtdlpArgs = buildYtDlpSegmentArgs({
+      sourceUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      startSec: 330,
+      endSec: 378,
+      outputTemplatePath: '/tmp/clip_custom.mp4',
+      playerClients: 'tv,visionos,web_safari',
+      cookiesFilePath: '/tmp/wo-yt-cookies.txt',
+    });
+    expect(customYtdlpArgs.join(' ')).toContain('tv,visionos,web_safari');
+    expect(customYtdlpArgs).toContain('--cookies');
+    expect(customYtdlpArgs).toContain('/tmp/wo-yt-cookies.txt');
 
     expect(
       extractDirectYoutubeVideoIdFromText(
