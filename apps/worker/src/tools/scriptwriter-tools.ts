@@ -64,18 +64,112 @@ function parseViewCountText(text?: string): number {
 }
 
 /**
+ * Detecta se o usuario colou um link direto de video do YouTube na instrucao
+ * (ex: "Crie um short com o momento mais marcante do video https://www.youtube.com/watch?v=3_vgiC3hAfE").
+ */
+export function extractDirectYoutubeVideoIdFromText(rawText: string): string | null {
+  const match = rawText.match(
+    /(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+  );
+  return match?.[1] ?? null;
+}
+
+/**
+ * Busca os metadados reais de um video especifico do YouTube quando o usuario informa a URL direta na instrucao.
+ */
+export async function fetchDirectYoutubeVideoCandidate(
+  videoId: string,
+): Promise<CandidatePodcastVideo | null> {
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return null;
+  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+  try {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent':
+          'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'IOS',
+            clientVersion: '20.10.4',
+            deviceMake: 'Apple',
+            deviceModel: 'iPhone16,2',
+            osName: 'iPhone',
+            osVersion: '18.3.2.22D82',
+            hl: 'pt',
+            gl: 'BR',
+          },
+        },
+        videoId,
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+
+    if (res.ok) {
+      const data = (await res.json()) as {
+        videoDetails?: {
+          videoId?: string;
+          title?: string;
+          author?: string;
+          lengthSeconds?: string;
+          viewCount?: string;
+          shortDescription?: string;
+        };
+      };
+      const vd = data.videoDetails;
+      if (vd?.title) {
+        return {
+          videoId,
+          url: watchUrl,
+          title: vd.title,
+          channelTitle: vd.author ?? 'YouTube',
+          publishedAt: new Date().toISOString(),
+          durationSec: Math.max(60, Number(vd.lengthSeconds ?? 600)),
+          viewCount: Number(vd.viewCount ?? 0),
+          description: (vd.shortDescription ?? '').slice(0, 500),
+        };
+      }
+    }
+  } catch {
+    // Fallback para watch HTML abaixo
+  }
+
+  const signals = await fetchYoutubeWatchPageSignals(watchUrl);
+  if (signals.videoId) {
+    return {
+      videoId,
+      url: watchUrl,
+      title: `Vídeo YouTube (${videoId})`,
+      channelTitle: 'YouTube',
+      publishedAt: new Date().toISOString(),
+      durationSec: signals.durationSec ?? 600,
+      description: signals.description ?? '',
+    };
+  }
+
+  return null;
+}
+
+/**
  * Limpa comandos imperativos da instrucao do usuario para extrair o termo puro de busca no YouTube.
  * Ex: "Crie um video curto do youtuber Davy Jones falando sobre o novo GTA" -> "Davy Jones falando sobre o novo GTA"
  */
 export function extractCleanYoutubeSearchQuery(rawInstruction: string): string {
-  const cleaned = rawInstruction
+  const withoutUrls = rawInstruction
+    .replace(/https?:\/\/\S+/gi, '')
+    .trim();
+  const cleaned = withoutUrls
     .replace(
-      /^\s*(?:crie|criar|fa[cç]a|fazer|gere|gerar|produza|produzir|recorte|edite|publi(?:que|car))\s+(?:\d{1,2}|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez)?\s*(?:v[ií]deos?|shorts?|cortes?|clipes?)?\s*(?:curtos?|r[aá]pidos?|virais?)?\s*(?:do\s+youtuber|da\s+youtuber|do\s+canal|da|do|de|sobre)?\s*/i,
+      /^\s*(?:crie|criar|fa[cç]a|fazer|gere|gerar|produza|produzir|recorte|edite|publi(?:que|car))\s+(?:\d{1,2}|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez)?\s*(?:v[ií]deos?|shorts?|cortes?|clipes?)?\s*(?:curtos?|r[aá]pidos?|virais?)?\s*(?:com\s+o\s+momento\s+mais\s+marcante\s+do\s+v[ií]deo(?:\s+a\s+seguir)?|do\s+[uú]ltimo\s+v[ií]deo\s+do\s+canal|do\s+v[ií]deo\s+a\s+seguir|do\s+youtuber|da\s+youtuber|do\s+canal|da|do|de|sobre)?\s*/i,
       '',
     )
     .trim();
 
-  return cleaned.length >= 3 ? cleaned : rawInstruction.trim();
+  return cleaned.length >= 3 ? cleaned : (withoutUrls || rawInstruction.trim());
 }
 
 function parseDurationTextToSec(text?: string): number {
@@ -420,6 +514,29 @@ export async function searchTrendingTopicsForScriptwriter(
     };
   }
 
+  // 0. Se o usuario informou um link direto de video do YouTube na instrucao, usa esse video imediatamente!
+  const directVideoId = extractDirectYoutubeVideoIdFromText(cleanQuery);
+  if (directVideoId) {
+    const directVideo = await fetchDirectYoutubeVideoCandidate(directVideoId);
+    if (directVideo) {
+      return {
+        query: cleanQuery,
+        source: 'youtube_html_search',
+        trends: [
+          {
+            title: directVideo.title,
+            url: directVideo.url,
+            channel: directVideo.channelTitle,
+            durationSec: directVideo.durationSec,
+            snippet:
+              directVideo.description ||
+              `Vídeo direto solicitado pelo usuário (${directVideo.channelTitle} • ${directVideo.durationSec}s)`,
+          },
+        ],
+      };
+    }
+  }
+
   // 1. YouTube Data API v3 (OAuth do Cofre do usuario)
   const apiVideos = await searchRealYoutubeVideosViaDataApi(cleanQuery, oauth, 6);
   if (apiVideos.length > 0) {
@@ -542,6 +659,17 @@ export async function listChannelOrTopicVideos(
         durationSec: 2400,
       },
     ];
+  }
+
+  // 0. Se o usuario informou um link direto de video do YouTube na instrucao (ou em channelOrTopicUrl), retorna-o como Candidato #1!
+  const directId =
+    extractDirectYoutubeVideoIdFromText(topic) ??
+    extractDirectYoutubeVideoIdFromText(channelOrTopicUrl);
+  if (directId) {
+    const directCandidate = await fetchDirectYoutubeVideoCandidate(directId);
+    if (directCandidate) {
+      return [directCandidate];
+    }
   }
 
   // 1. YouTube Data API v3 via Vault OAuth

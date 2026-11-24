@@ -694,13 +694,27 @@ export function buildDynamicSrtSubtitles(
     .join('\n');
 }
 
+const YOUTUBE_IOS_USER_AGENT =
+  'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+
+const YOUTUBE_IOS_CLIENT_CONTEXT = {
+  clientName: 'IOS',
+  clientVersion: '20.10.4',
+  deviceMake: 'Apple',
+  deviceModel: 'iPhone16,2',
+  osName: 'iPhone',
+  osVersion: '18.3.2.22D82',
+  hl: 'pt',
+  gl: 'BR',
+};
+
 /**
  * Detecta o idioma falado ORIGINAL do video no YouTube (ex: "pt", "en", "es")
- * inspecionando a faixa ASR (auto-generated) do InnerTube ANDROID player.
+ * inspecionando a faixa ASR (auto-generated) do InnerTube IOS player (que nao sofre bloqueio de PO Token em datacenter).
  * Nunca traduz: garante que videos em portugues fiquem em portugues e em ingles fiquem em ingles.
  */
 export async function detectYoutubeOriginalLanguage(sourceUrl: string): Promise<string | null> {
-  const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   if (!idMatch?.[1]) return null;
 
   try {
@@ -708,17 +722,11 @@ export async function detectYoutubeOriginalLanguage(sourceUrl: string): Promise<
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
+        'User-Agent': YOUTUBE_IOS_USER_AGENT,
       },
       body: JSON.stringify({
         context: {
-          client: {
-            clientName: 'ANDROID',
-            clientVersion: '20.10.38',
-            androidSdkVersion: 34,
-            hl: 'en',
-            gl: 'US',
-          },
+          client: YOUTUBE_IOS_CLIENT_CONTEXT,
         },
         videoId: idMatch[1],
       }),
@@ -747,25 +755,31 @@ export async function detectYoutubeOriginalLanguage(sourceUrl: string): Promise<
 }
 
 /**
- * Monta os argumentos reais do `yt-dlp` para baixar apenas o segmento especifico (start-end).
+ * Monta os argumentos reais do `yt-dlp` para baixar apenas o segmento especifico (start-end)
+ * priorizando clientes IOS/MWEB/TV e suportando streams DASH (bestvideo+bestaudio) com merge para MP4.
  */
 export function buildYtDlpSegmentArgs(params: {
   sourceUrl: string;
   startSec: number;
   endSec: number;
   outputTemplatePath: string;
+  playerClients?: string;
 }): string[] {
   validateSafeExternalUrl(params.sourceUrl, { enforceAllowedMediaHost: true });
   validateShortClipDuration(params.startSec, params.endSec);
 
+  const clients = params.playerClients ?? 'ios,mweb,tv_embedded,android,web';
+
   return [
     '--no-playlist',
     '--extractor-args',
-    'youtube:player_client=android,web',
+    `youtube:player_client=${clients}`,
     '--download-sections',
     `*${params.startSec}-${params.endSec}`,
     '-f',
-    'mp4[height<=1080]/best[ext=mp4]/best',
+    'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best[height<=1080]/best',
+    '--merge-output-format',
+    'mp4',
     '-o',
     params.outputTemplatePath,
     params.sourceUrl,
@@ -773,7 +787,207 @@ export function buildYtDlpSegmentArgs(params: {
 }
 
 /**
- * Baixa o trecho real [startSec, endSec] do YouTube usando yt-dlp para um arquivo temporario.
+ * Camada 1 Direta (Anti-Bloqueio de Datacenter):
+ * Consulta a API InnerTube com o cliente IOS (que entrega `adaptiveFormats` H.264 1080p + AAC M4A com HTTP 206 Range sem exigir PO Token)
+ * e recorta diretamente o intervalo [startSec, endSec] via `ffmpeg` com timestamps PTS normalizados em t=0!
+ */
+async function tryDownloadSegmentViaInnertubeIosAndFfmpeg(params: {
+  sourceUrl: string;
+  startSec: number;
+  endSec: number;
+  outputPath: string;
+}): Promise<{ ok: boolean; reason?: string }> {
+  const idMatch = params.sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+  if (!idMatch?.[1]) {
+    return { ok: false, reason: 'Video ID nao identificado na URL.' };
+  }
+  const videoId = idMatch[1];
+  const clipDuration = validateShortClipDuration(params.startSec, params.endSec);
+
+  try {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': YOUTUBE_IOS_USER_AGENT,
+      },
+      body: JSON.stringify({
+        context: {
+          client: YOUTUBE_IOS_CLIENT_CONTEXT,
+        },
+        videoId,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) {
+      return { ok: false, reason: `InnerTube IOS HTTP ${res.status}` };
+    }
+
+    const data = (await res.json()) as {
+      playabilityStatus?: { status?: string; reason?: string };
+      streamingData?: {
+        hlsManifestUrl?: string;
+        formats?: {
+          url?: string;
+          mimeType?: string;
+          height?: number;
+          bitrate?: number;
+        }[];
+        adaptiveFormats?: {
+          url?: string;
+          mimeType?: string;
+          height?: number;
+          bitrate?: number;
+        }[];
+      };
+    };
+
+    if (data.playabilityStatus?.status !== 'OK') {
+      return {
+        ok: false,
+        reason: `InnerTube IOS status=${data.playabilityStatus?.status ?? 'UNKNOWN'} (${data.playabilityStatus?.reason ?? ''})`,
+      };
+    }
+
+    const adaptive = data.streamingData?.adaptiveFormats ?? [];
+    const muxed = data.streamingData?.formats ?? [];
+
+    // Prioriza H.264 (avc1) <= 1080p para recorte rapido e 100% compativel
+    const videoCandidates = adaptive
+      .filter((f) => f.url && f.mimeType?.includes('video/mp4') && (f.height ?? 0) <= 1080)
+      .sort((a, b) => {
+        const aAvc = a.mimeType?.includes('avc1') ? 1 : 0;
+        const bAvc = b.mimeType?.includes('avc1') ? 1 : 0;
+        if (aAvc !== bAvc) return bAvc - aAvc;
+        return (b.height ?? 0) - (a.height ?? 0);
+      });
+
+    const audioCandidates = adaptive
+      .filter((f) => f.url && (f.mimeType?.includes('audio/mp4') || f.mimeType?.includes('audio/webm')))
+      .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+
+    const bestVideo = videoCandidates[0];
+    const bestAudio = audioCandidates[0];
+
+    if (bestVideo?.url && bestAudio?.url) {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-user_agent',
+          YOUTUBE_IOS_USER_AGENT,
+          '-ss',
+          String(params.startSec),
+          '-t',
+          String(clipDuration),
+          '-i',
+          bestVideo.url,
+          '-user_agent',
+          YOUTUBE_IOS_USER_AGENT,
+          '-ss',
+          String(params.startSec),
+          '-t',
+          String(clipDuration),
+          '-i',
+          bestAudio.url,
+          '-map',
+          '0:v:0',
+          '-map',
+          '1:a:0',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'ultrafast',
+          '-crf',
+          '20',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-ar',
+          '44100',
+          '-shortest',
+          params.outputPath,
+        ],
+        { timeout: 65_000 },
+      );
+
+      const stat = await fs.stat(params.outputPath).catch(() => null);
+      if (stat && stat.size > 4096) {
+        return { ok: true };
+      }
+    }
+
+    // Fallback para stream muxed ou HLS manifest do IOS se adaptive nao estiver separado
+    const muxedOrHlsUrl = muxed.find((f) => f.url)?.url ?? data.streamingData?.hlsManifestUrl;
+    if (muxedOrHlsUrl) {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-user_agent',
+          YOUTUBE_IOS_USER_AGENT,
+          '-ss',
+          String(params.startSec),
+          '-t',
+          String(clipDuration),
+          '-i',
+          muxedOrHlsUrl,
+          '-c:v',
+          'libx264',
+          '-preset',
+          'ultrafast',
+          '-crf',
+          '20',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-ar',
+          '44100',
+          params.outputPath,
+        ],
+        { timeout: 65_000 },
+      );
+
+      const stat = await fs.stat(params.outputPath).catch(() => null);
+      if (stat && stat.size > 4096) {
+        return { ok: true };
+      }
+    }
+
+    return { ok: false, reason: 'InnerTube IOS nao retornou streams de video/audio validos.' };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: (err as Error).message?.slice(-240) ?? 'Erro no download InnerTube IOS',
+    };
+  }
+}
+
+function extractMeaningfulYtDlpError(err: unknown): string {
+  const e = err as { stderr?: string; message?: string };
+  const raw = `${e.stderr ?? ''}\n${e.message ?? ''}`.trim();
+  const errorLines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('ERROR:'));
+  if (errorLines.length > 0) {
+    return errorLines.join(' | ').slice(0, 280);
+  }
+  return raw.slice(-280);
+}
+
+/**
+ * Baixa o trecho real [startSec, endSec] do YouTube em cascata resiliente:
+ * 1) Stream direto via InnerTube IOS + ffmpeg (imune ao bloqueio PO Token do cliente android e ja normaliza PTS=0)
+ * 2) yt-dlp com clientes ios,mweb,tv_embedded e merge DASH bestvideo+bestaudio
+ * 3) yt-dlp com clientes android,web
  */
 export async function downloadVideoSegmentToFile(params: {
   sourceUrl: string;
@@ -782,8 +996,9 @@ export async function downloadVideoSegmentToFile(params: {
   outputPath: string;
 }): Promise<{ ok: boolean; reason?: string }> {
   const isRealYoutubeWatchUrl =
-    /^https?:\/\/(?:www\.|m\.)?youtube\.com\/watch\?v=[a-zA-Z0-9_-]{11}/.test(params.sourceUrl) ||
-    /^https?:\/\/youtu\.be\/[a-zA-Z0-9_-]{11}/.test(params.sourceUrl);
+    /^https?:\/\/(?:www\.|m\.)?youtube\.com\/(?:watch\?v=|shorts\/)[a-zA-Z0-9_-]{11}/.test(
+      params.sourceUrl,
+    ) || /^https?:\/\/youtu\.be\/[a-zA-Z0-9_-]{11}/.test(params.sourceUrl);
 
   if (!isRealYoutubeWatchUrl) {
     return {
@@ -792,64 +1007,78 @@ export async function downloadVideoSegmentToFile(params: {
     };
   }
 
-  try {
-    const ytdlpArgs = buildYtDlpSegmentArgs({
-      sourceUrl: params.sourceUrl,
-      startSec: params.startSec,
-      endSec: params.endSec,
-      outputTemplatePath: params.outputPath,
-    });
-    await execFileAsync('yt-dlp', ytdlpArgs, { timeout: 75_000 });
-    const stat = await fs.stat(params.outputPath).catch(() => null);
-    if (stat && stat.size > 4096) {
-      // Normaliza os timestamps PTS de video e audio para t=0.000s exato:
-      // evita o desalinhamento de keyframe do yt-dlp --download-sections que deslocava metade das legendas!
-      const normPath = `${params.outputPath}.norm.mp4`;
-      try {
-        await execFileAsync(
-          'ffmpeg',
-          [
-            '-y',
-            '-fflags',
-            '+genpts',
-            '-i',
-            params.outputPath,
-            '-avoid_negative_ts',
-            'make_zero',
-            '-c:v',
-            'libx264',
-            '-preset',
-            'ultrafast',
-            '-crf',
-            '20',
-            '-pix_fmt',
-            'yuv420p',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '128k',
-            '-ar',
-            '44100',
-            normPath,
-          ],
-          { timeout: 40_000 },
-        );
-        const normStat = await fs.stat(normPath).catch(() => null);
-        if (normStat && normStat.size > 4096) {
-          await fs.rename(normPath, params.outputPath);
-        }
-      } catch {
-        await fs.rm(normPath, { force: true }).catch(() => {});
-      }
-      return { ok: true };
-    }
-    return { ok: false, reason: 'Arquivo baixado pelo yt-dlp ficou vazio (< 4 KB).' };
-  } catch (err) {
-    return {
-      ok: false,
-      reason: (err as Error).message?.slice(0, 260) ?? 'Erro desconhecido no yt-dlp',
-    };
+  // Camada 1: InnerTube IOS + ffmpeg Range (nao exige PO Token e ja entrega MP4 com PTS=0!)
+  const iosResult = await tryDownloadSegmentViaInnertubeIosAndFfmpeg(params);
+  if (iosResult.ok) {
+    return { ok: true };
   }
+
+  // Camada 2 e 3: yt-dlp com perfis de cliente variados
+  const clientProfiles = ['ios,mweb,tv_embedded', 'android,web'];
+  let lastErrorReason = iosResult.reason ?? 'Erro desconhecido';
+
+  for (const profile of clientProfiles) {
+    try {
+      await fs.rm(params.outputPath, { force: true }).catch(() => {});
+      const ytdlpArgs = buildYtDlpSegmentArgs({
+        sourceUrl: params.sourceUrl,
+        startSec: params.startSec,
+        endSec: params.endSec,
+        outputTemplatePath: params.outputPath,
+        playerClients: profile,
+      });
+      await execFileAsync('yt-dlp', ytdlpArgs, { timeout: 75_000 });
+      const stat = await fs.stat(params.outputPath).catch(() => null);
+      if (stat && stat.size > 4096) {
+        const normPath = `${params.outputPath}.norm.mp4`;
+        try {
+          await execFileAsync(
+            'ffmpeg',
+            [
+              '-y',
+              '-fflags',
+              '+genpts',
+              '-i',
+              params.outputPath,
+              '-avoid_negative_ts',
+              'make_zero',
+              '-c:v',
+              'libx264',
+              '-preset',
+              'ultrafast',
+              '-crf',
+              '20',
+              '-pix_fmt',
+              'yuv420p',
+              '-c:a',
+              'aac',
+              '-b:a',
+              '128k',
+              '-ar',
+              '44100',
+              normPath,
+            ],
+            { timeout: 40_000 },
+          );
+          const normStat = await fs.stat(normPath).catch(() => null);
+          if (normStat && normStat.size > 4096) {
+            await fs.rename(normPath, params.outputPath);
+          }
+        } catch {
+          await fs.rm(normPath, { force: true }).catch(() => {});
+        }
+        return { ok: true };
+      }
+      lastErrorReason = `Arquivo baixado pelo yt-dlp (${profile}) ficou vazio (< 4 KB).`;
+    } catch (err) {
+      lastErrorReason = extractMeaningfulYtDlpError(err);
+    }
+  }
+
+  return {
+    ok: false,
+    reason: `${lastErrorReason} (InnerTube IOS: ${iosResult.reason ?? 'falhou'})`,
+  };
 }
 
 /**

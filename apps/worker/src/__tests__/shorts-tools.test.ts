@@ -8,6 +8,8 @@ import {
   buildYtDlpSegmentArgs,
   ExternalUrlValidationError,
   extractBestTranscriptWindowForShort,
+  extractCleanYoutubeSearchQuery,
+  extractDirectYoutubeVideoIdFromText,
   fetchShortAnalyticsSnapshot,
   formatCuesToAnimatedAss,
   formatCuesToSrt,
@@ -64,6 +66,19 @@ describe('@workoffice/worker — Etapa 6 (Tools Reais de Pesquisa, Edicao 9:16/S
     });
     expect(ytdlpArgs).toContain('--download-sections');
     expect(ytdlpArgs).toContain('*120-172');
+    expect(ytdlpArgs).toContain('--merge-output-format');
+    expect(ytdlpArgs.join(' ')).toContain('ios,mweb');
+
+    expect(
+      extractDirectYoutubeVideoIdFromText(
+        'Crie um short com o momento mais marcante do video a seguir https://www.youtube.com/watch?v=3_vgiC3hAfE',
+      ),
+    ).toBe('3_vgiC3hAfE');
+    expect(
+      extractCleanYoutubeSearchQuery(
+        'Crie um short do ultimo video do canal República Coisa de Nerd falando sobre o GTA 6',
+      ),
+    ).toBe('República Coisa de Nerd falando sobre o GTA 6');
 
     const ffmpegArgs = buildFfmpegVerticalShortArgs({
       inputVideoPath: '/tmp/in.mp4',
