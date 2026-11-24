@@ -1261,10 +1261,187 @@ function extractMeaningfulYtDlpError(err: unknown): string {
 }
 
 /**
- * Baixa o trecho real [startSec, endSec] do YouTube em cascata resiliente com cache persistente em `/tmp/wo-yt-media-cache`:
- * 0) Cache local do container (`/tmp/wo-yt-media-cache/<videoId>_<startSec>_<endSec>.mp4`)
- * 1) Stream direto via sessao `/embed` + InnerTube (`IOS` / `ANDROID_VR`) + cache de URLs de stream por 40 min
- * 2) yt-dlp com visitor_data + cookies da sessao `/embed` (`ios,mweb,tv_embedded` e `android,web`)
+ * Recorta [startSec, endSec] a partir de arquivos locais de video.mp4 e audio.m4a (ou video muxed)
+ * com timestamps PTS zerados em t=0.
+ */
+async function sliceLocalVideoAndAudioStreamsWithFfmpeg(params: {
+  localVideoPath: string;
+  localAudioPath?: string;
+  startSec: number;
+  clipDuration: number;
+  outputPath: string;
+}): Promise<boolean> {
+  const args = params.localAudioPath
+    ? [
+        '-y',
+        '-ss',
+        String(params.startSec),
+        '-t',
+        String(params.clipDuration),
+        '-i',
+        params.localVideoPath,
+        '-ss',
+        String(params.startSec),
+        '-t',
+        String(params.clipDuration),
+        '-i',
+        params.localAudioPath,
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        '20',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ar',
+        '44100',
+        '-shortest',
+        params.outputPath,
+      ]
+    : [
+        '-y',
+        '-ss',
+        String(params.startSec),
+        '-t',
+        String(params.clipDuration),
+        '-i',
+        params.localVideoPath,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        '20',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ar',
+        '44100',
+        params.outputPath,
+      ];
+
+  await execFileAsync('ffmpeg', args, { timeout: 45_000 });
+  const stat = await fs.stat(params.outputPath).catch(() => null);
+  return Boolean(stat && stat.size > 4096);
+}
+
+/**
+ * Camada 0B — Cache Persistente no Supabase Storage (`shorts` bucket em `yt-cache/<videoId>/...`):
+ * Permite que qualquer trecho [startSec, endSec] de um video cacheado no Supabase Storage
+ * seja recortado localmente no Worker com ZERO chamadas ao YouTube (imune a bloqueio de IP no Railway!).
+ */
+async function trySliceSegmentFromSupabaseStorageCache(params: {
+  videoId: string;
+  startSec: number;
+  endSec: number;
+  outputPath: string;
+  cacheDir: string;
+  supabaseStorageClient?: SupabaseClient | null;
+}): Promise<boolean> {
+  const clipDuration = validateShortClipDuration(params.startSec, params.endSec);
+  const localFullVideo = path.join(params.cacheDir, `${params.videoId}_video.mp4`);
+  const localFullAudio = path.join(params.cacheDir, `${params.videoId}_audio.m4a`);
+
+  // 1. Verifica se o stream completo ja foi baixado do Supabase Storage para o disco local do container
+  const existingVideoStat = await fs.stat(localFullVideo).catch(() => null);
+  const existingAudioStat = await fs.stat(localFullAudio).catch(() => null);
+  if (existingVideoStat && existingVideoStat.size > 16_384) {
+    try {
+      const ok = await sliceLocalVideoAndAudioStreamsWithFfmpeg({
+        localVideoPath: localFullVideo,
+        localAudioPath:
+          existingAudioStat && existingAudioStat.size > 4096 ? localFullAudio : undefined,
+        startSec: params.startSec,
+        clipDuration,
+        outputPath: params.outputPath,
+      });
+      if (ok) return true;
+    } catch {
+      // Continua para verificar Storage
+    }
+  }
+
+  if (!params.supabaseStorageClient) return false;
+
+  // 2. Verifica se este exato segmento [startSec, endSec] ja esta salvo no bucket 'shorts'
+  const remoteSegPath = `yt-cache/${params.videoId}/${params.startSec}_${params.endSec}.mp4`;
+  try {
+    const { data: segData, error: segErr } = await params.supabaseStorageClient.storage
+      .from('shorts')
+      .download(remoteSegPath);
+    if (!segErr && segData) {
+      const buf = Buffer.from(await segData.arrayBuffer());
+      if (buf.byteLength > 4096) {
+        await fs.writeFile(params.outputPath, buf);
+        return true;
+      }
+    }
+  } catch {
+    // Segue para verificar streams completos no Storage
+  }
+
+  // 3. Verifica se os streams base `yt-cache/<videoId>/video.mp4` + `audio.m4a` estao no bucket 'shorts'
+  try {
+    const [videoDl, audioDl] = await Promise.all([
+      params.supabaseStorageClient.storage
+        .from('shorts')
+        .download(`yt-cache/${params.videoId}/video.mp4`),
+      params.supabaseStorageClient.storage
+        .from('shorts')
+        .download(`yt-cache/${params.videoId}/audio.m4a`),
+    ]);
+
+    if (!videoDl.error && videoDl.data) {
+      const vBuf = Buffer.from(await videoDl.data.arrayBuffer());
+      if (vBuf.byteLength > 16_384) {
+        await fs.mkdir(params.cacheDir, { recursive: true });
+        await fs.writeFile(localFullVideo, vBuf);
+
+        let hasAudio = false;
+        if (!audioDl.error && audioDl.data) {
+          const aBuf = Buffer.from(await audioDl.data.arrayBuffer());
+          if (aBuf.byteLength > 4096) {
+            await fs.writeFile(localFullAudio, aBuf);
+            hasAudio = true;
+          }
+        }
+
+        const ok = await sliceLocalVideoAndAudioStreamsWithFfmpeg({
+          localVideoPath: localFullVideo,
+          localAudioPath: hasAudio ? localFullAudio : undefined,
+          startSec: params.startSec,
+          clipDuration,
+          outputPath: params.outputPath,
+        });
+        if (ok) return true;
+      }
+    }
+  } catch {
+    // Segue para download direto
+  }
+
+  return false;
+}
+
+/**
+ * Baixa o trecho real [startSec, endSec] do YouTube em cascata resiliente com cache persistente
+ * no disco local (`/tmp/wo-yt-media-cache`) e no Supabase Storage (`shorts` bucket em `yt-cache/<videoId>/...`):
+ * 0A) Cache local do container (`/tmp/wo-yt-media-cache/<videoId>_<startSec>_<endSec>.mp4`)
+ * 0B) Cache persistente no Supabase Storage (`yt-cache/<videoId>/video.mp4` + `audio.m4a` ou segmento)
+ * 1) Stream direto via InnerTube `IOS` + cache de URLs de stream por 40 min
+ * 2) yt-dlp (`ios,mweb,tv_embedded` e `android,web`)
  * 3) Fallback via APIs publicas de stream mirror (Piped)
  */
 export async function downloadVideoSegmentToFile(params: {
@@ -1272,6 +1449,7 @@ export async function downloadVideoSegmentToFile(params: {
   startSec: number;
   endSec: number;
   outputPath: string;
+  supabaseStorageClient?: SupabaseClient | null;
 }): Promise<{ ok: boolean; reason?: string }> {
   const isRealYoutubeWatchUrl =
     /^https?:\/\/(?:www\.|m\.)?youtube\.com\/(?:watch\?v=|shorts\/)[a-zA-Z0-9_-]{11}/.test(
@@ -1286,14 +1464,14 @@ export async function downloadVideoSegmentToFile(params: {
   }
 
   const videoId =
-    params.sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/)?.[1] ?? ' clip';
+    params.sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/)?.[1] ?? 'clip';
   const cacheDir = path.join(os.tmpdir(), 'wo-yt-media-cache');
   const cachedSegmentPath = path.join(
     cacheDir,
     `${videoId}_${params.startSec}_${params.endSec}.mp4`,
   );
 
-  // Camada 0: Cache em disco do container Railway (se este trecho ja foi baixado antes, reutiliza instantaneamente!)
+  // Camada 0A: Cache em disco do container Railway (se este exato trecho ja foi baixado antes, reutiliza instantaneamente!)
   try {
     const cachedStat = await fs.stat(cachedSegmentPath).catch(() => null);
     if (cachedStat && cachedStat.size > 4096) {
@@ -1301,27 +1479,54 @@ export async function downloadVideoSegmentToFile(params: {
       return { ok: true };
     }
   } catch {
-    // Segue para download
+    // Segue
   }
 
-  const saveToDiskCache = async () => {
+  // Camada 0B: Cache persistente no Supabase Storage (`yt-cache/<videoId>/video.mp4` + `audio.m4a` ou segmento)
+  const fromStorageCache = await trySliceSegmentFromSupabaseStorageCache({
+    videoId,
+    startSec: params.startSec,
+    endSec: params.endSec,
+    outputPath: params.outputPath,
+    cacheDir,
+    supabaseStorageClient: params.supabaseStorageClient,
+  });
+  if (fromStorageCache) {
     try {
       await fs.mkdir(cacheDir, { recursive: true });
       await fs.copyFile(params.outputPath, cachedSegmentPath);
+    } catch {
+      // Best-effort
+    }
+    return { ok: true };
+  }
+
+  const saveToDiskAndStorageCache = async () => {
+    try {
+      await fs.mkdir(cacheDir, { recursive: true });
+      await fs.copyFile(params.outputPath, cachedSegmentPath);
+      if (params.supabaseStorageClient) {
+        const segBuf = await fs.readFile(params.outputPath);
+        await params.supabaseStorageClient.storage
+          .from('shorts')
+          .upload(`yt-cache/${videoId}/${params.startSec}_${params.endSec}.mp4`, segBuf, {
+            contentType: 'video/mp4',
+            upsert: true,
+          });
+      }
     } catch {
       // Cache best-effort
     }
   };
 
-  // Camada 1: Sessao `/embed` + InnerTube IOS/ANDROID_VR + cache de stream URLs + ffmpeg Range
+  // Camada 1: InnerTube IOS + cache de stream URLs + ffmpeg Range
   const iosResult = await tryDownloadSegmentViaInnertubeIosAndFfmpeg(params);
   if (iosResult.ok) {
-    await saveToDiskCache();
+    await saveToDiskAndStorageCache();
     return { ok: true };
   }
 
-  // Camada 2: yt-dlp com visitor_data + cookies da sessao `/embed`
-  const session = await fetchYoutubeEmbedVisitorSession(videoId);
+  // Camada 2: yt-dlp com perfis de cliente variados
   const clientProfiles = ['ios,mweb,tv_embedded', 'android,web'];
   let lastErrorReason = iosResult.reason ?? 'Erro desconhecido';
 
@@ -1334,8 +1539,6 @@ export async function downloadVideoSegmentToFile(params: {
         endSec: params.endSec,
         outputTemplatePath: params.outputPath,
         playerClients: profile,
-        visitorData: session.visitorData,
-        cookieHeader: session.cookieHeader,
       });
       await execFileAsync('yt-dlp', ytdlpArgs, { timeout: 75_000 });
       const stat = await fs.stat(params.outputPath).catch(() => null);
@@ -1377,7 +1580,7 @@ export async function downloadVideoSegmentToFile(params: {
         } catch {
           await fs.rm(normPath, { force: true }).catch(() => {});
         }
-        await saveToDiskCache();
+        await saveToDiskAndStorageCache();
         return { ok: true };
       }
       lastErrorReason = `Arquivo baixado pelo yt-dlp (${profile}) ficou vazio (< 4 KB).`;
@@ -1389,7 +1592,7 @@ export async function downloadVideoSegmentToFile(params: {
   // Camada 3: Fallback via APIs publicas de stream mirror (Piped)
   const mirrorResult = await tryDownloadSegmentViaPublicStreamMirrors(params);
   if (mirrorResult.ok) {
-    await saveToDiskCache();
+    await saveToDiskAndStorageCache();
     return { ok: true };
   }
 
@@ -2069,6 +2272,7 @@ export async function renderShortVideoPackage(params: {
           startSec: params.startSec,
           endSec: params.endSec,
           outputPath: rawClipFile,
+          supabaseStorageClient: params.supabaseStorageClient,
         });
         downloadedRealClip = dl.ok;
         ytDlpFailureReason = dl.reason ?? '';

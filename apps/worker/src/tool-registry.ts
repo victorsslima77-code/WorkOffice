@@ -267,6 +267,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
           startSec,
           endSec,
           outputPath: rawClipPath,
+          supabaseStorageClient: ctx.supabaseStorageClient,
         });
         if (dl.ok) {
           ctx.downloadedClipPath = rawClipPath;
