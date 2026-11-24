@@ -569,7 +569,7 @@ export function buildActiveEditSegments(params: {
     return {
       startSec: seg.startSec,
       endSec: seg.endSec,
-      zoomFactor: shouldZoom ? 1.07 : 1.0,
+      zoomFactor: shouldZoom ? 1.05 : 1.0,
     };
   });
 }
@@ -1414,11 +1414,28 @@ export async function extractSpokenSubtitlesFromClip(params: {
 }
 
 /**
+ * Constroi o filtro de enquadramento de MEIO-TERMO IDEAL (Balanced 16:9 -> 9:16 Framing):
+ * - Nao estica/corta 100% da altura (crop 9:16 puro mostrava apenas 31.6% da largura e cortava 2 pessoas na tela)
+ * - Nao encolhe 100% da largura (fit 16:9 puro deixava a altura util com apenas 608px, muito pequena)
+ * - Meio-termo ideal (proporcao 6:5 = 1.20:1): preserva ~68% da largura horizontal original (enquadrando perfeitamente
+ *   1 ou 2 pessoas lado a lado) e entrega uma area util grande de 1080x900 centralizada no canvas vertical 1080x1920
+ *   (com espaco limpo abaixo para as legendas animadas estilo CapCut sem tampar o rosto dos apresentadores).
+ */
+export function buildBalancedVerticalFramingFilterExpr(zoomFactor = 1.0): string {
+  const z = zoomFactor > 1.01 ? Math.min(1.08, zoomFactor) : 1.0;
+  const cropExpr =
+    z > 1.0
+      ? `crop=ih*1.20/${z.toFixed(2)}:ih/${z.toFixed(2)}`
+      : 'crop=ih*1.20:ih';
+  return `${cropExpr},scale=1080:900:flags=lanczos,pad=1080:1920:0:460:color=0x0b0f19,setsar=1`;
+}
+
+/**
  * Monta os argumentos reais de linha de comando do `ffmpeg` para:
  * - Recorte da janela de tempo (<= 60s)
- * - Crop central + scale para vertical 9:16 (1080x1920)
- * - Zoom sutil opcional quando solicitado pelas instrucoes do roteirista
- * - Queima (burn-in) opcional de legendas .srt estilizadas
+ * - Enquadramento de meio-termo balanceado (1080x900 util dentro do canvas vertical 1080x1920)
+ * - Zoom sutil opcional em momentos especificos
+ * - Queima (burn-in) opcional de legendas .ass / .srt estilizadas
  */
 export function buildFfmpegVerticalShortArgs(params: {
   inputVideoPath: string;
@@ -1431,9 +1448,7 @@ export function buildFfmpegVerticalShortArgs(params: {
 }): string[] {
   const safeDuration = validateShortClipDuration(0, params.durationSec);
   const filters: string[] = [
-    params.applyDynamicZoom ? 'crop=ih*9/16*0.93:ih*0.93' : 'crop=ih*9/16:ih',
-    'scale=1080:1920:flags=lanczos',
-    'setsar=1',
+    buildBalancedVerticalFramingFilterExpr(params.applyDynamicZoom ? 1.05 : 1.0),
     'eq=contrast=1.04:saturation=1.08:brightness=0.01',
     'unsharp=3:3:0.3',
     'vignette=angle=PI/5',
@@ -1485,7 +1500,8 @@ export function buildFfmpegVerticalShortArgs(params: {
 /**
  * Monta o filter_complex de edicao autoral do Agente Editor:
  * - Recorta apenas segmentos ativos (removendo pausas silenciosas)
- * - Aplica punch-in zoom sutil (1.07x) em momentos especificos de destaque
+ * - Aplica enquadramento de meio-termo balanceado (1080x900 util em canvas 1080x1920, ideal para 1 ou 2 pessoas em tela)
+ * - Aplica punch-in zoom sutil (1.05x) em momentos especificos de destaque
  * - Aplica transicoes sutis entre cortes (xfade no video + acrossfade no audio)
  * - Aplica assinatura visual discreta (contraste/cor/nitidez/vinheta suave)
  * - Queima legendas .ass com transicoes variadas sincronizadas na linha do tempo pos-cortes
@@ -1510,13 +1526,9 @@ export function buildFfmpegSignatureEditArgs(params: {
   const graphParts: string[] = [];
 
   segs.forEach((seg, idx) => {
-    const z = seg.zoomFactor > 1.01 ? seg.zoomFactor : 1;
-    const cropExpr =
-      z > 1
-        ? `crop=ih*9/16/${z.toFixed(2)}:ih/${z.toFixed(2)}`
-        : 'crop=ih*9/16:ih';
+    const framingExpr = buildBalancedVerticalFramingFilterExpr(seg.zoomFactor);
     graphParts.push(
-      `[0:v]trim=start=${seg.startSec.toFixed(3)}:end=${seg.endSec.toFixed(3)},setpts=PTS-STARTPTS,${cropExpr},scale=1080:1920:flags=lanczos,setsar=1,fps=30,format=yuv420p,eq=contrast=1.04:saturation=1.08:brightness=0.01,unsharp=3:3:0.3[v${idx}]`,
+      `[0:v]trim=start=${seg.startSec.toFixed(3)}:end=${seg.endSec.toFixed(3)},setpts=PTS-STARTPTS,${framingExpr},fps=30,format=yuv420p,eq=contrast=1.04:saturation=1.08:brightness=0.01,unsharp=3:3:0.3[v${idx}]`,
     );
     graphParts.push(
       `[0:a]atrim=start=${seg.startSec.toFixed(3)}:end=${seg.endSec.toFixed(3)},asetpts=PTS-STARTPTS,aresample=44100[a${idx}]`,

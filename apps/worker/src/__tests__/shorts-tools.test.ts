@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildActiveEditSegments,
+  buildBalancedVerticalFramingFilterExpr,
   buildDynamicSrtSubtitles,
   buildFfmpegSignatureEditArgs,
   buildFfmpegThumbnailCaptureArgs,
@@ -86,8 +87,11 @@ describe('@workoffice/worker — Etapa 6 (Tools Reais de Pesquisa, Edicao 9:16/S
       subtitleSrtPath: '/tmp/subs.srt',
       durationSec: 52,
     });
-    expect(ffmpegArgs.join(' ')).toContain('scale=1080:1920');
+    expect(ffmpegArgs.join(' ')).toContain('crop=ih*1.20:ih');
+    expect(ffmpegArgs.join(' ')).toContain('scale=1080:900');
+    expect(ffmpegArgs.join(' ')).toContain('pad=1080:1920:0:460');
     expect(ffmpegArgs.join(' ')).toContain('subtitles=');
+    expect(buildBalancedVerticalFramingFilterExpr(1.05)).toContain('crop=ih*1.20/1.05:ih/1.05');
   });
 
   it('renderiza pacote MP4 vertical + SRT, faz upload para canal de testes OAuth e coleta metricas iniciais', async () => {
