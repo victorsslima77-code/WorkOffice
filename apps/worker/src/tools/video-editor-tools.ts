@@ -295,8 +295,10 @@ export function formatAssTimestamp(seconds: number): string {
 }
 
 /**
- * Gera legendas em formato Advanced SubStation Alpha (.ass) com estilo proprio e
- * transicoes sutis variadas (pop, fade_slide, blur_in) preservando 100% da fala real no idioma original.
+ * Gera legendas em formato Advanced SubStation Alpha (.ass) no padrao CapCut Auto Captions:
+ * - Blocos curtos com transicoes animadas entre TODAS as legendas (capcut_bounce / pop, capcut_slide_up / fade_slide, capcut_zoom_glow / blur_in)
+ * - Auto-destaque na palavra de impacto de cada bloco com cor vibrante + leve pop de escala (sem usar {\r}, preservando \pos e \move!)
+ * - Zero sobreposicao temporal entre uma legenda e a seguinte.
  */
 export function formatCuesToAnimatedAss(
   cues: readonly SpokenSubtitleCue[],
@@ -310,16 +312,18 @@ export function formatCuesToAnimatedAss(
       .filter((w) => w.length >= 2),
   );
 
+  // Cores no formato BGR do ASS (&H00BBGGRR&)
+  const baseWhiteAss = '&H00FFFFFF&';
   const accentAssColor =
     style?.accentColor === 'red'
-      ? '&H005A5AFF&'
+      ? '&H004848FF&'
       : style?.accentColor === 'green'
-        ? '&H0088FF9E&'
+        ? '&H0066FF00&'
         : style?.accentColor === 'cyan'
-          ? '&H00FFE66D&'
+          ? '&H00FFFF00&'
           : style?.accentColor === 'white'
-            ? '&H00FFFFFF&'
-            : '&H004CE8FF&';
+            ? '&H0000E6FF&'
+            : '&H0000E6FF&'; // Amarelo CapCut (#FFE600)
 
   const transitionPalette: SubtitleTransitionStyle[] =
     style?.subtitleTransitions && style.subtitleTransitions.length > 0
@@ -329,29 +333,59 @@ export function formatCuesToAnimatedAss(
   const escapeAssText = (raw: string): string =>
     raw.replace(/\\/g, '\\\\').replace(/\{/g, '(').replace(/\}/g, ')').replace(/\r?\n/g, '\\N');
 
-  const applyHighlights = (text: string): string => {
-    let out = escapeAssText(text.trim());
-    if (highlightSet.size === 0) return out;
-    for (const kw of highlightSet) {
-      const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re = new RegExp(`(${escaped})`, 'gi');
-      out = out.replace(
-        re,
-        (match) => `{\\c${accentAssColor}\\fscx106\\fscy106}${match.toUpperCase()}{\\r}`,
-      );
+  // IMPORTANTE: NUNCA usar {\r} no ASS porque {\r} reseta \pos, \move e \fad da linha inteira no libass!
+  // Em vez disso, fechamos o destaque restaurando explicitamente a cor base e a escala 100%.
+  const wrapHighlightedWord = (word: string): string =>
+    `{\\c${accentAssColor}\\fscx110\\fscy110}${word.toUpperCase()}{\\c${baseWhiteAss}\\fscx100\\fscy100}`;
+
+  const applyCapCutWordEmphasis = (text: string): string => {
+    const clean = escapeAssText(text.trim());
+    const tokens = clean.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return clean;
+
+    let matchedExplicit = false;
+    const styledTokens = tokens.map((tok) => {
+      const stripped = tok.replace(/[^a-zA-Z0-9À-ÿ]/g, '').toLowerCase();
+      if (stripped.length >= 2 && highlightSet.has(stripped)) {
+        matchedExplicit = true;
+        return wrapHighlightedWord(tok);
+      }
+      return tok;
+    });
+
+    if (matchedExplicit) {
+      return styledTokens.join(' ');
     }
-    return out;
+
+    // Padrao CapCut Dynamic Captions: destaca automaticamente a palavra mais expressiva do bloco (>= 4 letras)
+    let bestIdx = -1;
+    let bestLen = 0;
+    tokens.forEach((tok, idx) => {
+      const stripped = tok.replace(/[^a-zA-Z0-9À-ÿ]/g, '');
+      if (stripped.length >= 4 && stripped.length > bestLen) {
+        bestLen = stripped.length;
+        bestIdx = idx;
+      }
+    });
+
+    if (bestIdx !== -1) {
+      tokens[bestIdx] = wrapHighlightedWord(tokens[bestIdx]!);
+    }
+
+    return tokens.join(' ');
   };
 
   const buildTransitionTag = (kind: SubtitleTransitionStyle): string => {
     if (kind === 'fade_slide') {
-      return '{\\an2\\move(540,1634,540,1610,0,150)\\fad(110,65)}';
+      // CapCut Slide-Up: entra subindo suavemente + fade-in e fade-out entre legendas
+      return '{\\an2\\move(540,1598,540,1562,0,125)\\fad(75,55)}';
     }
     if (kind === 'blur_in') {
-      return '{\\an2\\pos(540,1610)\\blur3.5\\t(0,120,\\blur0)\\fad(95,60)}';
+      // CapCut Zoom-Glow: entra com leve desfoque + zoom suave
+      return '{\\an2\\pos(540,1562)\\blur3.5\\fscx86\\fscy86\\t(0,115,\\blur0\\fscx104\\fscy104)\\t(115,175,\\fscx100\\fscy100)\\fad(70,55)}';
     }
-    // pop discreto
-    return '{\\an2\\pos(540,1610)\\fscx91\\fscy91\\t(0,105,\\fscx103\\fscy103)\\t(105,180,\\fscx100\\fscy100)\\fad(75,55)}';
+    // CapCut Pop Bounce: entrada elastica classica do CapCut entre cada bloco de legenda
+    return '{\\an2\\pos(540,1562)\\fscx78\\fscy78\\t(0,85,\\fscx107\\fscy107)\\t(85,155,\\fscx100\\fscy100)\\fad(55,50)}';
   };
 
   const header = [
@@ -364,18 +398,28 @@ export function formatCuesToAnimatedAss(
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    'Style: WorkOfficeShort,DejaVu Sans,60,&H00FFFFFF,&H0000FFFF,&H00121212,&H64000000,-1,0,0,0,100,100,0.5,0,1,4,2,2,70,70,310,1',
+    'Style: WorkOfficeShort,DejaVu Sans,64,&H00FFFFFF,&H0000E6FF,&H000A0A0A,&H78000000,-1,0,0,0,100,100,0.6,0,1,5,3,2,65,65,340,1',
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
   ];
 
-  const dialogues = cues.map((cue, idx) => {
+  // Garante zero sobreposicao temporal entre uma legenda e a proxima para que a transicao entre elas seja 100% visivel
+  const nonOverlapping = cues.map((cue, idx) => {
     const safeStart = Math.max(0, cue.startSec);
-    const safeEnd = Math.max(safeStart + 0.16, cue.endSec);
+    const nextStart = cues[idx + 1]?.startSec;
+    const maxEnd =
+      typeof nextStart === 'number' && nextStart > safeStart + 0.14
+        ? nextStart - 0.02
+        : cue.endSec;
+    const safeEnd = Math.max(safeStart + 0.14, Math.min(cue.endSec, maxEnd));
+    return { startSec: safeStart, endSec: safeEnd, text: cue.text };
+  });
+
+  const dialogues = nonOverlapping.map((cue, idx) => {
     const txKind = transitionPalette[idx % transitionPalette.length]!;
-    const styledText = `${buildTransitionTag(txKind)}${applyHighlights(cue.text)}`;
-    return `Dialogue: 0,${formatAssTimestamp(safeStart)},${formatAssTimestamp(safeEnd)},WorkOfficeShort,,0,0,0,,${styledText}`;
+    const styledText = `${buildTransitionTag(txKind)}${applyCapCutWordEmphasis(cue.text)}`;
+    return `Dialogue: 0,${formatAssTimestamp(cue.startSec)},${formatAssTimestamp(cue.endSec)},WorkOfficeShort,,0,0,0,,${styledText}`;
   });
 
   return [...header, ...dialogues, ''].join('\n');
@@ -425,9 +469,9 @@ export function buildActiveEditSegments(params: {
   maxSegments?: number;
 }): ActiveEditSegment[] {
   const totalDur = Math.max(1, params.clipDurationSec);
-  const minCut = params.minSilenceToCutSec ?? 0.45;
-  const pad = params.paddingSec ?? 0.08;
-  const maxSegs = Math.max(2, params.maxSegments ?? 10);
+  const minCut = params.minSilenceToCutSec ?? 0.65;
+  const pad = params.paddingSec ?? 0.12;
+  const maxSegs = Math.max(2, params.maxSegments ?? 4);
 
   // Filtra apenas pausas longas o suficiente para remover sem picotar a fala
   const cuttable = params.silences
@@ -758,6 +802,45 @@ export async function downloadVideoSegmentToFile(params: {
     await execFileAsync('yt-dlp', ytdlpArgs, { timeout: 75_000 });
     const stat = await fs.stat(params.outputPath).catch(() => null);
     if (stat && stat.size > 4096) {
+      // Normaliza os timestamps PTS de video e audio para t=0.000s exato:
+      // evita o desalinhamento de keyframe do yt-dlp --download-sections que deslocava metade das legendas!
+      const normPath = `${params.outputPath}.norm.mp4`;
+      try {
+        await execFileAsync(
+          'ffmpeg',
+          [
+            '-y',
+            '-fflags',
+            '+genpts',
+            '-i',
+            params.outputPath,
+            '-avoid_negative_ts',
+            'make_zero',
+            '-c:v',
+            'libx264',
+            '-preset',
+            'ultrafast',
+            '-crf',
+            '20',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '128k',
+            '-ar',
+            '44100',
+            normPath,
+          ],
+          { timeout: 40_000 },
+        );
+        const normStat = await fs.stat(normPath).catch(() => null);
+        if (normStat && normStat.size > 4096) {
+          await fs.rename(normPath, params.outputPath);
+        }
+      } catch {
+        await fs.rm(normPath, { force: true }).catch(() => {});
+      }
       return { ok: true };
     }
     return { ok: false, reason: 'Arquivo baixado pelo yt-dlp ficou vazio (< 4 KB).' };
@@ -843,15 +926,40 @@ async function tryExtractSubtitlesViaYtDlp(params: {
 async function tryTranscribeViaLocalFasterWhisper(params: {
   rawClipPath: string;
   originalLang: string | null;
+  contextPrompt?: string;
   workDir: string;
 }): Promise<ExtractedSpokenTranscript | null> {
   const wavPath = path.join(params.workDir, 'clip_audio_16k.wav');
   try {
-    await execFileAsync(
-      'ffmpeg',
-      ['-y', '-i', params.rawClipPath, '-vn', '-ac', '1', '-ar', '16000', '-f', 'wav', wavPath],
-      { timeout: 30_000 },
-    );
+    // Isola a frequencia da voz humana (85Hz-7800Hz) e normaliza o volume antes de enviar ao Whisper,
+    // reduzindo drasticamente erros em trechos com musica de fundo ou efeitos sonoros de jogos!
+    try {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          params.rawClipPath,
+          '-vn',
+          '-af',
+          'highpass=f=85,lowpass=f=7800,dynaudnorm=p=0.9:s=5',
+          '-ac',
+          '1',
+          '-ar',
+          '16000',
+          '-f',
+          'wav',
+          wavPath,
+        ],
+        { timeout: 30_000 },
+      );
+    } catch {
+      await execFileAsync(
+        'ffmpeg',
+        ['-y', '-i', params.rawClipPath, '-vn', '-ac', '1', '-ar', '16000', '-f', 'wav', wavPath],
+        { timeout: 30_000 },
+      );
+    }
 
     const scriptCandidates = [
       path.resolve(__dirname, '../../scripts/transcribe_clip.py'),
@@ -872,9 +980,9 @@ async function tryTranscribeViaLocalFasterWhisper(params: {
     }
     if (!scriptPath) return null;
 
-    const pyArgs = [scriptPath, wavPath];
-    if (params.originalLang) {
-      pyArgs.push(params.originalLang);
+    const pyArgs = [scriptPath, wavPath, params.originalLang ?? 'auto'];
+    if (params.contextPrompt) {
+      pyArgs.push(params.contextPrompt.slice(0, 240));
     }
 
     const { stdout } = await execFileAsync('python3', pyArgs, {
@@ -1007,6 +1115,7 @@ export async function extractSpokenSubtitlesFromClip(params: {
   startSec: number;
   endSec: number;
   rawClipPath?: string;
+  contextPrompt?: string;
   workDir: string;
   provider?: LlmProvider;
   apiKey?: string;
@@ -1030,30 +1139,20 @@ export async function extractSpokenSubtitlesFromClip(params: {
 
   const originalLang = await detectYoutubeOriginalLanguage(params.sourceUrl);
 
-  // Camada 1: Legendas originais via yt-dlp
-  const fromYtDlp = await tryExtractSubtitlesViaYtDlp({
-    sourceUrl: params.sourceUrl,
-    startSec: params.startSec,
-    endSec: params.endSec,
-    originalLang,
-    workDir: params.workDir,
-  });
-  if (fromYtDlp && fromYtDlp.cues.length > 0) {
-    return fromYtDlp;
-  }
-
-  // Camada 2: faster-whisper local sobre o audio real do trecho baixado
+  // Prioridade CapCut Auto-Captions: quando temos o arquivo de audio real do clipe normalizado (PTS=0),
+  // priorizamos o faster-whisper word-level direto sobre o audio do clipe para sincronia milimetrica!
   if (params.rawClipPath) {
     const fromWhisper = await tryTranscribeViaLocalFasterWhisper({
       rawClipPath: params.rawClipPath,
       originalLang,
+      contextPrompt: params.contextPrompt,
       workDir: params.workDir,
     });
     if (fromWhisper && fromWhisper.cues.length > 0) {
       return fromWhisper;
     }
 
-    // Camada 3: Cloud STT (OpenAI Whisper / Gemini Audio)
+    // Camada 2: Cloud STT (OpenAI Whisper / Gemini Audio) sobre o mesmo audio do clipe
     const fromProvider = await tryTranscribeViaProviderAudioApi({
       rawClipPath: params.rawClipPath,
       originalLang,
@@ -1064,6 +1163,18 @@ export async function extractSpokenSubtitlesFromClip(params: {
     if (fromProvider && fromProvider.cues.length > 0) {
       return fromProvider;
     }
+  }
+
+  // Camada 3: Legendas originais via yt-dlp caso o audio local nao esteja disponivel
+  const fromYtDlp = await tryExtractSubtitlesViaYtDlp({
+    sourceUrl: params.sourceUrl,
+    startSec: params.startSec,
+    endSec: params.endSec,
+    originalLang,
+    workDir: params.workDir,
+  });
+  if (fromYtDlp && fromYtDlp.cues.length > 0) {
+    return fromYtDlp;
   }
 
   return {

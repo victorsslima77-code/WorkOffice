@@ -6,13 +6,17 @@ import {
   estimateTaskCostUsd,
   EVENT_VISUAL_CATALOG,
   getModelFromCatalog,
+  planYoutubeConsistencySchedule,
   planYoutubeShortPublication,
   PublishReportOutputSchema,
   ResearchBriefOutputSchema,
   ScriptwriterInputSchema,
   VideoEditorOutputSchema,
+  YOUTUBE_DAILY_CONSISTENCY_MAX_POSTS,
   YOUTUBE_DAILY_MAX_UPLOADS,
+  YOUTUBE_MATURE_WEEKLY_POSTS_TARGET,
   YOUTUBE_SHORTS_ROLES,
+  YOUTUBE_WARMUP_WEEKLY_POSTS_TARGET,
 } from '../index.js';
 
 describe('@workoffice/shared — Etapa 2 (Catalogo LLM, Eventos, Cargos e RLS Storage)', () => {
@@ -165,5 +169,75 @@ describe('@workoffice/shared — Etapa 2 (Catalogo LLM, Eventos, Cargos e RLS St
     expect(video7.slotInDay).toBe(1);
     expect(video7.scheduleDetails?.is_scheduled_due_to_quota).toBe(true);
     expect(video7.outputSummary).toContain('Agendamento Programado:');
+  });
+
+  it('controla o Plano de Constancia de Posts: 1 Short/dia, 4-5 Shorts/semana nas primeiras 3 semanas e 7 Shorts/semana a partir da 4a semana', () => {
+    expect(YOUTUBE_DAILY_CONSISTENCY_MAX_POSTS).toBe(1);
+    expect(YOUTUBE_WARMUP_WEEKLY_POSTS_TARGET).toBe(5);
+    expect(YOUTUBE_MATURE_WEEKLY_POSTS_TARGET).toBe(7);
+
+    const baseDate = new Date('2026-11-24T14:00:00.000Z');
+
+    // Lote de 6 videos recebidos no mesmo dia na Semana 1 do canal:
+    // - Video 1: publicado hoje (dayOffset = 0, slot 1/5 da Semana 1)
+    const v1 = planYoutubeConsistencySchedule({
+      videoIndex: 1,
+      baseDate,
+      officeCreatedAtIso: '2026-11-24T10:00:00.000Z',
+    });
+    expect(v1.publicationStatus).toBe('published');
+    expect(v1.dayOffset).toBe(0);
+    expect(v1.channelWeekNumber).toBe(1);
+    expect(v1.weeklyPostsTarget).toBe(5);
+    expect(v1.weeklyPostsAllocated).toBe(1);
+
+    // - Videos 2 a 5: agendados 1 por dia nos proximos 4 dias (dayOffset = 1..4, completando 5/5 na Semana 1)
+    const v2 = planYoutubeConsistencySchedule({
+      videoIndex: 2,
+      baseDate,
+      officeCreatedAtIso: '2026-11-24T10:00:00.000Z',
+    });
+    expect(v2.publicationStatus).toBe('scheduled');
+    expect(v2.dayOffset).toBe(1);
+    expect(v2.channelWeekNumber).toBe(1);
+    expect(v2.weeklyPostsAllocated).toBe(2);
+    expect(v2.scheduleDetails?.is_scheduled_due_to_consistency).toBe(true);
+
+    const v5 = planYoutubeConsistencySchedule({
+      videoIndex: 5,
+      baseDate,
+      officeCreatedAtIso: '2026-11-24T10:00:00.000Z',
+    });
+    expect(v5.publicationStatus).toBe('scheduled');
+    expect(v5.dayOffset).toBe(4);
+    expect(v5.channelWeekNumber).toBe(1);
+    expect(v5.weeklyPostsAllocated).toBe(5);
+
+    // - Video 6: como a Semana 1 ja atingiu o teto de 5 Shorts/semana (4-5/sem nas primeiras 3 semanas),
+    //   pula os 2 dias de respiro da Semana 1 e agenda automaticamente para o 1o dia da Semana 2 (dayOffset = 7)!
+    const v6 = planYoutubeConsistencySchedule({
+      videoIndex: 6,
+      baseDate,
+      officeCreatedAtIso: '2026-11-24T10:00:00.000Z',
+    });
+    expect(v6.publicationStatus).toBe('scheduled');
+    expect(v6.dayOffset).toBe(7);
+    expect(v6.channelWeekNumber).toBe(2);
+    expect(v6.weeklyPostsTarget).toBe(5);
+    expect(v6.weeklyPostsAllocated).toBe(1);
+
+    // A partir da 4a semana (ex: escritorio criado ha 21 dias -> inicio exato da Semana 4):
+    // a meta sobe para 7 Shorts/semana (1 por dia todos os dias, sem pular do 5o para o 8o dia)
+    const matureV6 = planYoutubeConsistencySchedule({
+      videoIndex: 6,
+      baseDate,
+      officeCreatedAtIso: '2026-11-03T10:00:00.000Z',
+    });
+    expect(matureV6.publicationStatus).toBe('scheduled');
+    expect(matureV6.channelWeekNumber).toBe(4);
+    expect(matureV6.weeklyPhase).toBe('mature_7_per_week');
+    expect(matureV6.weeklyPostsTarget).toBe(7);
+    expect(matureV6.dayOffset).toBe(5); // 6o video agendado continuamente no Dia +5 (6/7 da semana)
+    expect(matureV6.weeklyPostsAllocated).toBe(6);
   });
 });

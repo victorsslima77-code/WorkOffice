@@ -19,8 +19,21 @@ export const YOUTUBE_DAILY_QUOTA_UNITS = 10_000;
 export const YOUTUBE_UPLOAD_COST_UNITS = 1_600;
 export const YOUTUBE_DAILY_MAX_UPLOADS = Math.floor(
   YOUTUBE_DAILY_QUOTA_UNITS / YOUTUBE_UPLOAD_COST_UNITS,
-); // 6 videos/dia
-export const YOUTUBE_PUBLISH_INTERVAL_HOURS = 4; // 24h / 6 videos = 4h entre publicacoes
+); // 6 uploads tecnicos de API/dia
+export const YOUTUBE_PUBLISH_INTERVAL_HOURS = 4; // 24h / 6 videos = 4h entre uploads tecnicos
+
+/**
+ * Parametros do Plano de Constancia de Posts do Publicador (Recomendacao de Especialistas):
+ * - Limite diario de postagem ativa: 1 Short por dia (mesmo que receba 6 videos no dia, posta 1 hoje e agenda os outros 5 para os proximos dias)
+ * - Semanas 1 a 3 (Fase de Aquecimento / Ramp-Up): 4 a 5 Shorts por semana (teto padrao: 5/semana, com 2 dias de respiro na semana)
+ * - A partir da Semana 4 (Fase de Constancia Diaria): 7 Shorts por semana (1 por dia, todos os dias)
+ */
+export const YOUTUBE_DAILY_CONSISTENCY_MAX_POSTS = 1;
+export const YOUTUBE_WARMUP_WEEKS_THRESHOLD = 3;
+export const YOUTUBE_WARMUP_WEEKLY_POSTS_MIN = 4;
+export const YOUTUBE_WARMUP_WEEKLY_POSTS_TARGET = 5;
+export const YOUTUBE_MATURE_WEEKLY_POSTS_TARGET = 7;
+export const YOUTUBE_PREFERRED_PUBLISH_HOUR_UTC = 21; // 18:00 BRT (Horario nobre de Shorts)
 
 // 1. Roteirista / Pesquisador (scriptwriter)
 export const ScriptwriterInputSchema = z.object({
@@ -85,14 +98,21 @@ export type PublisherAnalystInput = z.infer<typeof PublisherAnalystInputSchema>;
 
 export const PublicationScheduleDetailsSchema = z.object({
   is_scheduled_due_to_quota: z.boolean(),
+  is_scheduled_due_to_consistency: z.boolean().optional(),
   day_offset: z.number().int().nonnegative(),
   slot_in_day: z.number().int().min(1).max(YOUTUBE_DAILY_MAX_UPLOADS),
   daily_quota_limit_videos: z.number().int().positive(),
+  daily_posts_limit: z.number().int().positive().optional(),
+  channel_week_number: z.number().int().positive().optional(),
+  weekly_phase: z.enum(['warmup_4_to_5_per_week', 'mature_7_per_week']).optional(),
+  weekly_posts_target: z.number().int().positive().optional(),
+  weekly_posts_allocated: z.number().int().positive().optional(),
   interval_hours: z.number().positive(),
   scheduled_for_iso: z.string(),
   scheduled_for_formatted: z.string(),
   quota_units_reserved: z.number().int().nonnegative(),
   reason: z.string().min(3),
+  consistency_analysis: z.string().optional(),
 });
 export type PublicationScheduleDetails = z.infer<typeof PublicationScheduleDetailsSchema>;
 
@@ -239,6 +259,227 @@ export function planYoutubeShortPublication(params: {
   };
 }
 
+export interface YoutubeConsistencySchedulePlan extends YoutubePublicationPlan {
+  channelWeekNumber: number;
+  weeklyPhase: 'warmup_4_to_5_per_week' | 'mature_7_per_week';
+  weeklyPostsTarget: number;
+  weeklyPostsAllocated: number;
+  dailyPostsLimit: number;
+  canUploadToYoutubeTodayWithPublishAt: boolean;
+}
+
+/**
+ * Planejador Estrategico de Constancia de Posts do Agente Publicador:
+ * - Limite estrito de 1 Short publicado por dia (mesmo que receba 6 videos no mesmo dia, posta apenas 1 hoje e agenda os 5 restantes para os proximos dias).
+ * - Nas primeiras 3 semanas do escritorio/canal (Semanas 1 a 3): agenda de 4 a 5 Shorts por semana (teto de 5/semana com 2 dias de respiro para maturar o algoritmo).
+ * - A partir da 4a semana (Semana 4+): sobe automaticamente para 7 Shorts por semana (1 por dia todos os dias).
+ * - Leva em conta todos os Shorts ja publicados ou agendados anteriormente pelo escritorio (`existingScheduledDatesIso`).
+ */
+export function planYoutubeConsistencySchedule(params: {
+  videoIndex: number;
+  baseDate?: Date;
+  officeCreatedAtIso?: string;
+  existingScheduledDatesIso?: readonly string[];
+  alreadyUploadedApiTodayCount?: number;
+  preferredPublishHourUtc?: number;
+  videoId?: string;
+}): YoutubeConsistencySchedulePlan {
+  const safeVideoIndex = Math.max(1, Math.round(params.videoIndex));
+  const now = params.baseDate ?? new Date();
+  const preferredHourUtc = params.preferredPublishHourUtc ?? YOUTUBE_PREFERRED_PUBLISH_HOUR_UTC;
+
+  const toUtcDayStartMs = (d: Date): number =>
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  const toDayKey = (dayStartMs: number): string => new Date(dayStartMs).toISOString().slice(0, 10);
+
+  const todayStartMs = toUtcDayStartMs(now);
+
+  // Determina a data de inicio do canal/escritorio para calcular em qual semana (1, 2, 3 ou 4+) estamos
+  let channelEpochStartMs = todayStartMs;
+  if (params.officeCreatedAtIso) {
+    const parsedOfficeDate = new Date(params.officeCreatedAtIso);
+    if (!Number.isNaN(parsedOfficeDate.getTime())) {
+      channelEpochStartMs = Math.min(channelEpochStartMs, toUtcDayStartMs(parsedOfficeDate));
+    }
+  }
+
+  const existingDates = (params.existingScheduledDatesIso ?? [])
+    .map((iso) => new Date(iso))
+    .filter((d) => !Number.isNaN(d.getTime()));
+
+  for (const d of existingDates) {
+    channelEpochStartMs = Math.min(channelEpochStartMs, toUtcDayStartMs(d));
+  }
+
+  const getWeekIndexFromEpoch = (dayStartMs: number): number =>
+    Math.max(0, Math.floor((dayStartMs - channelEpochStartMs) / (7 * 86_400_000)));
+
+  const occupiedDays = new Set<string>();
+  const postsPerWeek = new Map<number, number>();
+
+  for (const d of existingDates) {
+    const dayMs = toUtcDayStartMs(d);
+    const key = toDayKey(dayMs);
+    if (!occupiedDays.has(key)) {
+      occupiedDays.add(key);
+      const wIdx = getWeekIndexFromEpoch(dayMs);
+      postsPerWeek.set(wIdx, (postsPerWeek.get(wIdx) ?? 0) + 1);
+    }
+  }
+
+  // Se existingScheduledDatesIso nao foi passado (ex.: simulacao pura de lote 1..N),
+  // precisamos alocar os videos 1..(safeVideoIndex-1) antes de alocar o safeVideoIndex.
+  // Se existingScheduledDatesIso JA veio do banco (que ja inclui os videos anteriores do lote),
+  // alocamos apenas 1 novo slot livre!
+  const stepsToAllocate =
+    params.existingScheduledDatesIso !== undefined ? 1 : safeVideoIndex;
+
+  let chosenDayStartMs = todayStartMs;
+  let chosenDayOffset = 0;
+  let chosenWeekNumber = 1;
+  let chosenWeeklyTarget = YOUTUBE_WARMUP_WEEKLY_POSTS_TARGET;
+  let chosenWeeklyAllocated = 1;
+
+  for (let step = 1; step <= stepsToAllocate; step++) {
+    for (let offset = 0; offset < 365; offset++) {
+      const candidateDayMs = todayStartMs + offset * 86_400_000;
+      const dayKey = toDayKey(candidateDayMs);
+      if (occupiedDays.has(dayKey)) {
+        continue; // Limite estrito: maximo 1 Short por dia!
+      }
+
+      const weekIdx = getWeekIndexFromEpoch(candidateDayMs);
+      const weekNumber = weekIdx + 1;
+      const isWarmupPhase = weekNumber <= YOUTUBE_WARMUP_WEEKS_THRESHOLD;
+      const weeklyTarget = isWarmupPhase
+        ? YOUTUBE_WARMUP_WEEKLY_POSTS_TARGET // 5 Shorts/semana nas primeiras 3 semanas (recomendacao 4-5/sem)
+        : YOUTUBE_MATURE_WEEKLY_POSTS_TARGET; // 7 Shorts/semana a partir da 4a semana
+
+      const usedInWeek = postsPerWeek.get(weekIdx) ?? 0;
+      if (usedInWeek >= weeklyTarget) {
+        continue; // Meta semanal atingida: aguarda os dias de respiro ate abrir a proxima semana!
+      }
+
+      occupiedDays.add(dayKey);
+      const nextAllocated = usedInWeek + 1;
+      postsPerWeek.set(weekIdx, nextAllocated);
+
+      chosenDayStartMs = candidateDayMs;
+      chosenDayOffset = offset;
+      chosenWeekNumber = weekNumber;
+      chosenWeeklyTarget = weeklyTarget;
+      chosenWeeklyAllocated = nextAllocated;
+      break;
+    }
+  }
+
+  const weeklyPhase: 'warmup_4_to_5_per_week' | 'mature_7_per_week' =
+    chosenWeekNumber <= YOUTUBE_WARMUP_WEEKS_THRESHOLD
+      ? 'warmup_4_to_5_per_week'
+      : 'mature_7_per_week';
+
+  // Data/hora exata: se for hoje (chosenDayOffset === 0), publica agora;
+  // se for nos proximos dias (chosenDayOffset >= 1), programa para o horario nobre (21:00 UTC = 18:00 BRT)
+  const targetDate =
+    chosenDayOffset === 0
+      ? now
+      : new Date(chosenDayStartMs + preferredHourUtc * 3_600_000);
+  const scheduledAtIso = targetDate.toISOString();
+
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  const formattedDate = `${pad2(targetDate.getUTCDate())}/${pad2(targetDate.getUTCMonth() + 1)}/${targetDate.getUTCFullYear()} às ${pad2(targetDate.getUTCHours())}:${pad2(targetDate.getUTCMinutes())} UTC`;
+
+  const vPad = pad2(safeVideoIndex);
+  const youtubeVideoId = params.videoId ?? `yt_short_${vPad}`;
+  const shortUrl = `https://youtube.com/shorts/${youtubeVideoId}`;
+
+  const apiUploadsBeforeThis =
+    params.alreadyUploadedApiTodayCount ?? safeVideoIndex - 1;
+  const isWithinDailyApiQuota = apiUploadsBeforeThis < YOUTUBE_DAILY_MAX_UPLOADS;
+  const apiSlotToday = Math.min(YOUTUBE_DAILY_MAX_UPLOADS, apiUploadsBeforeThis + 1);
+
+  const phaseLabel =
+    weeklyPhase === 'warmup_4_to_5_per_week'
+      ? `Semana ${chosenWeekNumber} (Aquecimento: 4–5 Shorts/semana • slot ${chosenWeeklyAllocated}/${chosenWeeklyTarget})`
+      : `Semana ${chosenWeekNumber} (Escala Diária: 7 Shorts/semana • slot ${chosenWeeklyAllocated}/${chosenWeeklyTarget})`;
+
+  // Caso 1: 1o Short do dia atual e dentro da meta semanal -> Publica HOJE imediatamente como PUBLICO!
+  if (chosenDayOffset === 0 && isWithinDailyApiQuota) {
+    return {
+      videoIndex: safeVideoIndex,
+      youtubeVideoId,
+      shortUrl,
+      publicationStatus: 'published',
+      isWithinDailyQuota: true,
+      dailyQuotaUsedVideos: apiSlotToday,
+      dailyQuotaLimitVideos: YOUTUBE_DAILY_MAX_UPLOADS,
+      quotaUnitsConsumed: YOUTUBE_UPLOAD_COST_UNITS,
+      dailyQuotaUnitsLimit: YOUTUBE_DAILY_QUOTA_UNITS,
+      dayOffset: 0,
+      slotInDay: 1,
+      intervalHours: 24,
+      scheduledAtIso,
+      scheduledForFormatted: formattedDate,
+      scheduleDetails: null,
+      channelWeekNumber: chosenWeekNumber,
+      weeklyPhase,
+      weeklyPostsTarget: chosenWeeklyTarget,
+      weeklyPostsAllocated: chosenWeeklyAllocated,
+      dailyPostsLimit: YOUTUBE_DAILY_CONSISTENCY_MAX_POSTS,
+      canUploadToYoutubeTodayWithPublishAt: true,
+      outputSummary: `URL do Short Publicado Hoje (1/1 do dia • ${phaseLabel}): ${shortUrl}`,
+    };
+  }
+
+  // Caso 2: Ja houve 1 Short postado hoje (ou meta semanal de 5/semana atingida) -> Agenda para os proximos dias!
+  const reason = isWithinDailyApiQuota
+    ? `Plano de Constância de Posts (máx. 1 Short/dia • ${phaseLabel}): 1 Short já foi alocado para os dias anteriores, por isso este vídeo foi programado automaticamente para ${formattedDate} (Dia +${chosenDayOffset}).`
+    : `Plano de Constância (máx. 1 Short/dia • ${phaseLabel}) + Cota Diária da API atingida (${YOUTUBE_DAILY_MAX_UPLOADS}/dia): programado para ${formattedDate} (Dia +${chosenDayOffset}).`;
+
+  const scheduleDetails: PublicationScheduleDetails = {
+    is_scheduled_due_to_quota: !isWithinDailyApiQuota,
+    is_scheduled_due_to_consistency: true,
+    day_offset: chosenDayOffset,
+    slot_in_day: 1,
+    daily_quota_limit_videos: YOUTUBE_DAILY_MAX_UPLOADS,
+    daily_posts_limit: YOUTUBE_DAILY_CONSISTENCY_MAX_POSTS,
+    channel_week_number: chosenWeekNumber,
+    weekly_phase: weeklyPhase,
+    weekly_posts_target: chosenWeeklyTarget,
+    weekly_posts_allocated: chosenWeeklyAllocated,
+    interval_hours: 24,
+    scheduled_for_iso: scheduledAtIso,
+    scheduled_for_formatted: formattedDate,
+    quota_units_reserved: YOUTUBE_UPLOAD_COST_UNITS,
+    reason,
+  };
+
+  return {
+    videoIndex: safeVideoIndex,
+    youtubeVideoId,
+    shortUrl,
+    publicationStatus: 'scheduled',
+    isWithinDailyQuota: isWithinDailyApiQuota,
+    dailyQuotaUsedVideos: apiSlotToday,
+    dailyQuotaLimitVideos: YOUTUBE_DAILY_MAX_UPLOADS,
+    quotaUnitsConsumed: YOUTUBE_UPLOAD_COST_UNITS,
+    dailyQuotaUnitsLimit: YOUTUBE_DAILY_QUOTA_UNITS,
+    dayOffset: chosenDayOffset,
+    slotInDay: 1,
+    intervalHours: 24,
+    scheduledAtIso,
+    scheduledForFormatted: formattedDate,
+    scheduleDetails,
+    channelWeekNumber: chosenWeekNumber,
+    weeklyPhase,
+    weeklyPostsTarget: chosenWeeklyTarget,
+    weeklyPostsAllocated: chosenWeeklyAllocated,
+    dailyPostsLimit: YOUTUBE_DAILY_CONSISTENCY_MAX_POSTS,
+    canUploadToYoutubeTodayWithPublishAt: isWithinDailyApiQuota,
+    outputSummary: `Agendamento de Constância Programado: ${formattedDate} (Dia +${chosenDayOffset} • máx. 1 Short/dia • ${phaseLabel}) — ${shortUrl}`,
+  };
+}
+
 export interface OfficeRoleDefinition {
   slug: RoleSlug;
   name: string;
@@ -376,13 +617,13 @@ export const YOUTUBE_SHORTS_ROLES: readonly OfficeRoleDefinition[] = [
     allowedTools: ['youtube_upload_short', 'youtube_schedule_video', 'youtube_fetch_analytics'],
     workstationType: 'publishing_desk',
     scope:
-      'Retirar 1 vídeo editado por vez na sua estante (shelf_3), manter a periodicidade máxima respeitando a cota diária do YouTube (máx. 6 vídeos/dia, janela de 4h), publicar como público com título, descrição SEO, tags SEO e thumbnail capturada, ou agendar excedentes.',
+      'Retirar 1 vídeo editado por vez na sua estante (shelf_3), controlar toda a agenda de constância de posts do canal (limite estrito de 1 Short/dia; 4 a 5 Shorts/semana nas primeiras 3 semanas e 7 Shorts/semana a partir da 4ª semana), publicando apenas 1 vídeo no dia e programando os demais para os próximos dias com SEO completo e thumbnail.',
     systemPrompt:
-      'Você é o Publicador e Analista de Shorts do WorkOffice (Baia 3). Permaneça descansando na copa até receber um vídeo editado na sua estante (shelf_3). Ao retirar o vídeo da estante, verifique a cota diária da YouTube Data API v3 (10.000 unidades/dia ÷ 1.600 unidades/upload = máximo de 6 vídeos publicados por dia, espaçados a cada 4 horas). Para vídeos dentro da cota diária (1 a 6), publique o Short diretamente como PÚBLICO aplicando título SEO, descrição SEO envolvente (sem mensagens genéricas), 10 a 15 tags SEO e a thumbnail capturada pelo Editor, retornando a URL do Short publicado. Se produzirem mais vídeos do que a cota diária (7 em diante), agende automaticamente a publicação para as próximas janelas diárias e retorne o detalhe completo do agendamento (schedule_details).',
+      'Você é o Publicador e Analista Estrategista de Constância de Shorts do WorkOffice (Baia 3). Permaneça descansando na copa até receber um vídeo editado na sua estante (shelf_3). Ao retirar o vídeo da estante, controle rigorosamente o Plano de Constância de Posts do canal: (1) limite máximo de 1 Short publicado por dia — mesmo que receba 6 vídeos no mesmo dia (e que a cota técnica da API suporte 6 uploads/dia), publique apenas 1 Short hoje e programe os outros 5 para os próximos dias; (2) nas primeiras 3 semanas do canal/escritório (Semanas 1 a 3), mantenha a cadência recomendada por especialistas de 4 a 5 Shorts por semana (teto de 5/semana com dias de respiro); (3) a partir da 4ª semana (Semana 4+), escale a agenda para 7 Shorts por semana (1 por dia todos os dias); (4) aplique título SEO, descrição SEO envolvente, 10 a 15 tags SEO, thumbnail capturada pelo Editor e registre sua análise de constância (consistency_analysis) no relatório.',
     inputContractSummary:
       '1 vídeo Short vertical editado, legendado e com thumbnail capturada (edited_short) retirado da sua estante (shelf_3).',
     outputContractSummary:
-      '1 relatório (publish_report) contendo a URL do Short publicado, descrição, tags e status da thumbnail (se <= 6/dia) OU o detalhe completo do agendamento (se > 6/dia) + métricas em video_metrics.',
+      '1 relatório (publish_report) contendo a URL do Short publicado hoje (se 1º do dia) OU o agendamento programado na agenda de constância (1/dia • 4-5/sem nas semanas 1-3 • 7/sem na semana 4+) + métricas em video_metrics.',
   },
 ] as const;
 

@@ -70,6 +70,8 @@ export interface ToolExecutionContext {
   thumbnailBuffer?: Buffer;
   /** Duracao final em segundos do Short apos corte de pausas silenciosas e transicoes */
   renderedDurationSec?: number;
+  /** Analise de constancia de posts gerada pelo Agente Publicador */
+  consistencyAnalysis?: string;
   /** Caminho temporario local do trecho baixado pelo yt-dlp para reutilizacao entre transcricao e ffmpeg */
   downloadedClipPath?: string;
   /** Diretorio temporario de trabalho do clipe (limpo ao final da task) */
@@ -297,11 +299,21 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         );
       }
 
+      const contextPrompt = [
+        ctx.suggestedTitle,
+        ctx.hookText,
+        ...(ctx.seoTags ?? []).slice(0, 8),
+        ctx.instruction,
+      ]
+        .filter(Boolean)
+        .join(', ');
+
       const extracted = await extractSpokenSubtitlesFromClip({
         sourceUrl,
         startSec,
         endSec,
         rawClipPath: ctx.downloadedClipPath,
+        contextPrompt,
         workDir: ctx.tempWorkDir,
         provider: ctx.llmProvider,
         apiKey: ctx.llmApiKey,
@@ -468,6 +480,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         officeId: ctx.officeId,
         runId: ctx.runId,
         videoIndex: ctx.videoIndex,
+        consistencyAnalysis: ctx.consistencyAnalysis,
         title: cleanTitle,
         description: seoDescription,
         tags: seoTags,
@@ -487,8 +500,8 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
         progress: 50,
         message:
           uploaded.publicationStatus === 'published'
-            ? `Short #${ctx.videoIndex}/${ctx.totalVideos} publicado como ${uploaded.visibility.toUpperCase()} (${uploaded.tags.length} tags SEO • ${uploaded.thumbnailApplied ? 'thumbnail aplicada' : 'thumbnail salva'} • ${uploaded.mode}): ${uploaded.url}`
-            : `Cota diária (6/dia) atingida! Short #${ctx.videoIndex}/${ctx.totalVideos} agendado: ${uploaded.outputSummary}`,
+            ? `Short #${ctx.videoIndex}/${ctx.totalVideos} publicado HOJE (1/1 do dia • ${uploaded.visibility.toUpperCase()} • ${uploaded.tags.length} tags SEO • ${uploaded.thumbnailApplied ? 'thumbnail aplicada' : 'thumbnail salva'} • ${uploaded.mode}): ${uploaded.url}`
+            : `Plano de Constância (1 Short/dia): Short #${ctx.videoIndex}/${ctx.totalVideos} programado na agenda: ${uploaded.outputSummary}`,
       });
 
       return uploaded;
@@ -523,6 +536,7 @@ export const WORKER_TOOL_CATALOG: Record<string, RegisteredAgentTool> = {
           officeId: ctx.officeId,
           runId: ctx.runId,
           videoIndex: ctx.videoIndex,
+          consistencyAnalysis: ctx.consistencyAnalysis,
           title: cleanTitle,
           description: seoDescription,
           tags: seoTags,

@@ -4,7 +4,7 @@ import { createOpenAI } from '@ai-sdk/openai';
 import {
   EFFORT_CONFIG_MAP,
   getModelFromCatalog,
-  planYoutubeShortPublication,
+  planYoutubeConsistencySchedule,
   type EffortLevel,
   type LlmProvider,
   type RoleSlug,
@@ -115,6 +115,8 @@ interface ParsedVideoEditorLlmJson {
   cut_transition?: 'fade' | 'smoothleft' | 'smoothright' | 'dissolve';
   highlight_words?: string[];
   zoom_moments_sec?: number[];
+  /** Correcoes foneticas estilo CapCut revisando erros pontuais do ASR sem alterar timestamps */
+  corrected_cues?: { index?: number; text?: string }[];
   apply_dynamic_zoom?: boolean;
   thumbnail_offset_sec?: number;
   suggested_title?: string;
@@ -124,6 +126,7 @@ interface ParsedPublisherLlmJson {
   title?: string;
   description?: string;
   tags?: string[];
+  consistency_analysis?: string;
 }
 
 function tryParseJsonFromLlmText<T = ParsedScriptwriterLlmJson>(text: string): T | null {
@@ -714,41 +717,57 @@ export async function runRoleWithMultiProviderLlm(
         .filter(Boolean)
         .join('\n\n');
     } else if (req.roleSlug === 'video_editor') {
-      const cuesPreview = (ctx.spokenSubtitleCues ?? []).slice(0, 45);
+      const cuesPreview = (ctx.spokenSubtitleCues ?? []).slice(0, 60);
       const detectedLang = ctx.detectedVideoLanguage ?? 'original';
       const clipDuration = Math.max(
         5,
         Math.min(60, (ctx.endSec ?? 45) - (ctx.startSec ?? 0)),
       );
+      const contextNames = [
+        ctx.suggestedTitle,
+        ctx.hookText,
+        ...(ctx.seoTags ?? []).slice(0, 10),
+      ]
+        .filter(Boolean)
+        .join(' | ');
       rolePrompt = [
-        `Você é o Editor de Vídeo com estilo editorial próprio e sutil (duração do corte: ${clipDuration}s).`,
-        `O pipeline já corta automaticamente pausas sem som e aplica legendas da FALA REAL no idioma original ("${detectedLang}"). NÃO escreva nem traduza legendas.`,
+        `Você é o Editor de Vídeo com motor de legendas estilo CapCut Auto-Captions (duração do corte: ${clipDuration}s).`,
+        `Contexto real do vídeo (para revisar nomes próprios, jogos e termos que o ASR possa ter trocado por homófonos): ${contextNames || ctx.instruction}`,
         cuesPreview.length > 0
-          ? `Falas REAIS transcritas do áudio do vídeo (idioma "${detectedLang}"):\n${cuesPreview.map((c) => `[${c.startSec.toFixed(1)}s] ${c.text}`).join('\n')}`
+          ? `Blocos de fala transcritos automaticamente do áudio (idioma original "${detectedLang}"):\n${cuesPreview.map((c, idx) => `[${idx}] (${c.startSec.toFixed(2)}s–${c.endSec.toFixed(2)}s) ${c.text}`).join('\n')}`
           : `Nenhuma fala foi detectada no áudio do vídeo.`,
-        `Defina detalhes sutis de identidade editorial para enriquecer o Short (sem exageros visuais) retornando APENAS um JSON válido:`,
+        `SUA TAREFA DE REVISÃO FONÉTICA (ESTILO CAPCUT):`,
+        `- Revise os blocos [0]..[${Math.max(0, cuesPreview.length - 1)}] acima. Se o reconhecedor de voz (ASR) trocou alguma palavra por outra parecida foneticamente sem sentido no contexto (ex.: errou o nome do youtuber, do jogo, programa de TV ou gíria), inclua apenas os blocos corrigidos em "corrected_cues" mantendo EXATAMENTE o mesmo "index", o mesmo idioma ("${detectedLang}") e o mesmo tamanho curto (2 a 5 palavras). NUNCA invente frases fora do que foi dito.`,
+        `- Defina também as transições animadas estilo CapCut entre as legendas ("pop", "fade_slide", "blur_in"), cor de destaque e momentos de zoom sutil.`,
+        `Retorne APENAS um JSON válido:`,
         `{`,
-        `  "subtitle_accent_color": "<escolha entre: yellow, cyan, green ou white>",`,
+        `  "subtitle_accent_color": "<yellow, cyan, green ou white>",`,
         `  "subtitle_transitions": ["pop", "fade_slide", "blur_in"],`,
-        `  "cut_transition": "<transição discreta entre cortes: fade, smoothleft, smoothright ou dissolve>",`,
-        `  "highlight_words": ["<2 a 5 palavras EXATAS que aparecem literalmente nas falas acima no idioma ${detectedLang}>"],`,
-        `  "zoom_moments_sec": [<1 a 3 timestamps em segundos entre 2 e ${Math.max(3, clipDuration - 2)} onde aplicar um punch-in zoom sutil>],`,
-        `  "thumbnail_offset_sec": <número em segundos entre 1 e ${Math.max(2, clipDuration - 1)} indicando o melhor instante do corte para capturar a thumbnail>`,
+        `  "cut_transition": "<fade, smoothleft, smoothright ou dissolve>",`,
+        `  "highlight_words": ["<3 a 6 palavras de impacto EXATAS presentes nas falas>"],`,
+        `  "corrected_cues": [`,
+        `    { "index": 0, "text": "<texto corrigido foneticamente se necessário>" }`,
+        `  ],`,
+        `  "zoom_moments_sec": [<1 a 3 timestamps em segundos entre 2 e ${Math.max(3, clipDuration - 2)} onde aplicar punch-in zoom sutil>],`,
+        `  "thumbnail_offset_sec": <número em segundos entre 1 e ${Math.max(2, clipDuration - 1)} para capturar a thumbnail>`,
         `}`,
       ].join('\n\n');
     } else {
       const existingTags =
         ctx.seoTags && ctx.seoTags.length > 0 ? ctx.seoTags.join(', ') : 'nenhuma ainda';
       rolePrompt = [
-        `Você é o Publicador SEO de YouTube Shorts (Vídeo #${vNum}/${ctx.totalVideos}).`,
+        `Você é o Publicador e Estrategista de Constância de YouTube Shorts (Vídeo #${vNum}/${ctx.totalVideos}).`,
         `Tema do vídeo: "${ctx.suggestedTitle ?? ctx.instruction}"`,
         ctx.hookText ? `Gancho/Resumo do corte: "${ctx.hookText}"` : '',
         ctx.seoDescription
           ? `Rascunho de descrição enviado pelo Roteirista:\n${ctx.seoDescription}`
           : '',
         `Tags sugeridas pelo Roteirista: ${existingTags}`,
-        `Gere os metadados FINAIS otimizados para publicação PÚBLICA no YouTube Shorts.`,
-        `REGRAS OBRIGATÓRIAS:`,
+        `PLANO DE CONSTÂNCIA DE POSTS QUE VOCÊ CONTROLA:`,
+        `- Limite de 1 Short publicado por dia: mesmo recebendo até 6 vídeos no dia, apenas 1 vai ao ar hoje e os demais são programados (publishAt) para os próximos dias.`,
+        `- Nas primeiras 3 semanas do canal (Semanas 1 a 3): cadência recomendada de 4 a 5 Shorts por semana (teto de 5/semana com 2 dias de respiro).`,
+        `- A partir da 4ª semana (Semana 4+): escala para 7 Shorts por semana (1 por dia todos os dias).`,
+        `REGRAS OBRIGATÓRIAS DE SEO:`,
         `- NUNCA repita o comando do usuário (ex: "Crie um vídeo...") nem escreva "Short produzido pelo WorkOffice".`,
         `- A descrição deve descrever o conteúdo real do corte em 2 a 4 linhas envolventes em português, incluir uma chamada para ação (CTA) curta e finalizar com 4 a 6 hashtags relevantes incluindo #shorts.`,
         `- Gere entre 10 e 15 tags de SEO altamente relevantes (sem o símbolo #) sobre o criador, assunto e nicho do vídeo.`,
@@ -756,7 +775,8 @@ export async function runRoleWithMultiProviderLlm(
         `{`,
         `  "title": "<título viral SEO em português com no máximo 90 caracteres terminando com #shorts>",`,
         `  "description": "<descrição completa otimizada para SEO do vídeo no YouTube Shorts com CTA e hashtags incluindo #shorts>",`,
-        `  "tags": ["<tag1>", "<tag2>", "<10 a 15 tags SEO relevantes sem #>"]`,
+        `  "tags": ["<tag1>", "<tag2>", "<10 a 15 tags SEO relevantes sem #>"],`,
+        `  "consistency_analysis": "<resumo de 1 a 2 frases da decisão de agenda para o Vídeo #${vNum}/${ctx.totalVideos} seguindo a regra de 1 Short/dia e progressão de 4-5/sem para 7/sem>"`,
         `}`,
       ]
         .filter(Boolean)
@@ -816,6 +836,10 @@ export async function runRoleWithMultiProviderLlm(
       if (parsedTags.length > 0) {
         ctx.seoTags = parsedTags;
       }
+
+      if (parsedPublisherJson?.consistency_analysis?.trim()) {
+        ctx.consistencyAnalysis = parsedPublisherJson.consistency_analysis.trim();
+      }
     }
 
     if (req.roleSlug === 'scriptwriter' && !parsedScriptJson) {
@@ -832,12 +856,32 @@ export async function runRoleWithMultiProviderLlm(
     await executeRegisteredTool('youtube_fetch_analytics', {}, ctx);
   }
 
-  // 2a fase do Editor: aplica estilo editorial proprio sutil (corte de silencio, transicoes variadas
-  // de legenda ASS, transicao leve entre cortes, punch-in zoom pontual) mantendo ctx.spokenSubtitleCues 100% IMUTAVEL!
+  // 2a fase do Editor: aplica revisao fonetica CapCut (mantendo timestamps 100% originais do audio)
+  // + transicoes animadas entre todas as legendas ASS, transicao leve entre cortes e punch-in zoom pontual!
   if (req.roleSlug === 'video_editor') {
     const allowedColors = new Set(['yellow', 'red', 'white', 'green', 'cyan']);
     const allowedSubTx = new Set(['pop', 'fade_slide', 'blur_in']);
     const allowedCutTx = new Set(['fade', 'smoothleft', 'smoothright', 'dissolve']);
+
+    if (
+      Array.isArray(parsedEditorJson?.corrected_cues) &&
+      Array.isArray(ctx.spokenSubtitleCues) &&
+      ctx.spokenSubtitleCues.length > 0
+    ) {
+      for (const fix of parsedEditorJson.corrected_cues) {
+        const idx = typeof fix?.index === 'number' ? Math.round(fix.index) : -1;
+        const newText = typeof fix?.text === 'string' ? fix.text.trim() : '';
+        const targetCue = idx >= 0 && idx < ctx.spokenSubtitleCues.length ? ctx.spokenSubtitleCues[idx] : undefined;
+        if (
+          targetCue &&
+          newText.length >= 2 &&
+          newText.length <= Math.max(42, targetCue.text.length * 1.8) &&
+          !/instru[cç][aã]o|roteirista|legenda|destaque|zoom/i.test(newText)
+        ) {
+          targetCue.text = newText;
+        }
+      }
+    }
 
     const spokenTranscriptLower = (ctx.spokenSubtitleCues ?? [])
       .map((c) => c.text.toLowerCase())
@@ -1068,7 +1112,7 @@ export async function runRoleWithMultiProviderLlm(
   } else {
     const uploaded = ctx.lastUploadedShort;
     const ytId = uploaded?.youtubeVideoId ?? `yt_${ctx.runId.slice(0, 6)}_${vPad}`;
-    const pubPlan = planYoutubeShortPublication({
+    const pubPlan = planYoutubeConsistencySchedule({
       videoIndex: vNum,
       videoId: ytId,
     });

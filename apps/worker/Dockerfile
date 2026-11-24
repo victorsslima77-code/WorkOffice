@@ -24,7 +24,7 @@ RUN python3 -m venv /opt/venv \
       || echo "[Dockerfile] faster-whisper wheel indisponivel; seguindo com yt-dlp subs + Cloud STT")
 ENV PATH="/opt/venv/bin:$PATH"
 ENV HF_HOME="/app/.whisper-cache"
-ENV WHISPER_MODEL_SIZE="tiny"
+ENV WHISPER_MODEL_SIZE="small"
 
 RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 

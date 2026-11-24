@@ -5,7 +5,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import {
-  planYoutubeShortPublication,
+  planYoutubeConsistencySchedule,
   type PublicationScheduleDetails,
 } from '@workoffice/shared';
 
@@ -24,6 +24,9 @@ export interface YoutubeUploadShortParams {
   runId: string;
   videoIndex: number;
   alreadyPublishedTodayCount?: number;
+  officeCreatedAtIso?: string;
+  existingScheduledDatesIso?: readonly string[];
+  consistencyAnalysis?: string;
   title: string;
   description: string;
   tags?: string[];
@@ -202,6 +205,79 @@ async function tryUploadYoutubeVideoThumbnail(params: {
 }
 
 /**
+ * Consulta no Supabase todo o historico de agendamentos e publicacoes (`publish_report`)
+ * e a data de criacao do escritorio para o Agente Publicador controlar o Plano de Constancia:
+ * - Limite de 1 Short por dia
+ * - 4 a 5 Shorts por semana nas primeiras 3 semanas (Semanas 1 a 3)
+ * - 7 Shorts por semana a partir da 4a semana (Semana 4+)
+ */
+export async function fetchOfficePublicationScheduleHistory(
+  supabase: SupabaseClient | null | undefined,
+  officeId: string,
+): Promise<{
+  officeCreatedAtIso?: string;
+  existingScheduledDatesIso: string[];
+  alreadyUploadedApiTodayCount: number;
+}> {
+  if (!supabase) {
+    return {
+      existingScheduledDatesIso: [],
+      alreadyUploadedApiTodayCount: 0,
+    };
+  }
+
+  let officeCreatedAtIso: string | undefined;
+  const existingScheduledDatesIso: string[] = [];
+  let alreadyUploadedApiTodayCount = 0;
+  const todayPrefix = new Date().toISOString().slice(0, 10);
+
+  try {
+    const { data: officeRow } = await supabase
+      .from('offices')
+      .select('created_at')
+      .eq('id', officeId)
+      .maybeSingle();
+    if (officeRow && typeof (officeRow as { created_at?: string }).created_at === 'string') {
+      officeCreatedAtIso = (officeRow as { created_at: string }).created_at;
+    }
+
+    const { data: reports } = await supabase
+      .from('artifacts')
+      .select('created_at, metadata, runs!inner(office_id)')
+      .eq('kind', 'publish_report')
+      .eq('runs.office_id', officeId)
+      .order('created_at', { ascending: true })
+      .limit(120);
+
+    for (const row of reports ?? []) {
+      const createdAt = typeof row.created_at === 'string' ? row.created_at : '';
+      if (createdAt.startsWith(todayPrefix)) {
+        alreadyUploadedApiTodayCount++;
+      }
+      const meta = (row.metadata ?? {}) as {
+        output?: {
+          published_videos?: { scheduled_at?: string }[];
+        };
+      };
+      const sched = meta.output?.published_videos?.[0]?.scheduled_at;
+      if (typeof sched === 'string' && sched.length >= 10) {
+        existingScheduledDatesIso.push(sched);
+      } else if (createdAt) {
+        existingScheduledDatesIso.push(createdAt);
+      }
+    }
+  } catch {
+    // Fallback para lista vazia se a consulta falhar em ambiente de teste
+  }
+
+  return {
+    officeCreatedAtIso,
+    existingScheduledDatesIso,
+    alreadyUploadedApiTodayCount,
+  };
+}
+
+/**
  * Troca o refresh_token OAuth salvo no Supabase Vault do usuario por um access_token valido do Google,
  * utilizando o client_id e client_secret encapsulados no proprio Vault do usuario (BYOK).
  */
@@ -269,13 +345,36 @@ export async function uploadShortToYoutubeChannel(
   const vPad = String(params.videoIndex).padStart(2, '0');
   const defaultVideoId = `yt_${params.runId.slice(0, 6)}_${vPad}`;
 
-  const plan = planYoutubeShortPublication({
+  // Se nao vier historico explicito e houver cliente Supabase, carrega a agenda real do escritorio
+  let officeCreatedAtIso = params.officeCreatedAtIso;
+  let existingScheduledDatesIso = params.existingScheduledDatesIso;
+  let alreadyUploadedApiTodayCount = params.alreadyPublishedTodayCount;
+
+  if (existingScheduledDatesIso === undefined && params.supabaseStorageClient) {
+    const history = await fetchOfficePublicationScheduleHistory(
+      params.supabaseStorageClient,
+      params.officeId,
+    );
+    officeCreatedAtIso = officeCreatedAtIso ?? history.officeCreatedAtIso;
+    existingScheduledDatesIso = history.existingScheduledDatesIso;
+    alreadyUploadedApiTodayCount =
+      alreadyUploadedApiTodayCount ?? history.alreadyUploadedApiTodayCount;
+  }
+
+  const plan = planYoutubeConsistencySchedule({
     videoIndex: params.videoIndex,
-    alreadyPublishedTodayCount: params.alreadyPublishedTodayCount,
+    officeCreatedAtIso,
+    existingScheduledDatesIso,
+    alreadyUploadedApiTodayCount,
     videoId: defaultVideoId,
   });
 
+  if (plan.scheduleDetails && params.consistencyAnalysis?.trim()) {
+    plan.scheduleDetails.consistency_analysis = params.consistencyAnalysis.trim();
+  }
+
   const scheduledAt = params.scheduledAtIso ?? plan.scheduledAtIso;
+  const isScheduledFuturePost = plan.publicationStatus === 'scheduled';
   const safeTitle = params.title.toLowerCase().includes('#shorts')
     ? params.title.slice(0, 100)
     : `${params.title.slice(0, 90)} #shorts`;
@@ -305,8 +404,8 @@ export async function uploadShortToYoutubeChannel(
   const defaultThumbPath =
     params.thumbnailPath?.trim() || `${params.officeId}/${params.runId}/short_${vPad}_thumb.jpg`;
 
-  // Quando o video excede a cota diaria (6 videos/dia), nao consome upload imediato da API hoje:
-  // agenda a publicacao para a proxima janela diaria
+  // Quando o video excede a cota tecnica diaria de 6 uploads/dia da YouTube Data API v3 (10.000 un/dia),
+  // nao consome chamada de upload da API hoje: mantem agendado na fila da agenda de constancia
   if (!plan.isWithinDailyQuota) {
     return {
       youtubeVideoId: plan.youtubeVideoId,
@@ -332,6 +431,20 @@ export async function uploadShortToYoutubeChannel(
     if (!tokenInfo.isSandbox) {
       const playableBuffer = await resolvePlayableMp4BufferForUpload(params);
       if (playableBuffer && playableBuffer.byteLength > 0) {
+        // Quando o Plano de Constancia agenda o video para os proximos dias (isScheduledFuturePost === true),
+        // a YouTube Data API v3 exige `privacyStatus: 'private'` + `publishAt: scheduledAt` (ISO 8601 futuro),
+        // programando o Short nativamente no YouTube Studio para ficar PUBLICO na data agendada!
+        const youtubeStatusPayload = isScheduledFuturePost
+          ? {
+              privacyStatus: 'private' as const,
+              publishAt: scheduledAt,
+              selfDeclaredMadeForKids: false,
+            }
+          : {
+              privacyStatus: params.visibility,
+              selfDeclaredMadeForKids: false,
+            };
+
         const metadataRes = await fetch(
           'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
           {
@@ -349,10 +462,7 @@ export async function uploadShortToYoutubeChannel(
                 tags: finalTags,
                 categoryId: '22',
               },
-              status: {
-                privacyStatus: params.visibility,
-                selfDeclaredMadeForKids: false,
-              },
+              status: youtubeStatusPayload,
             }),
           },
         );
@@ -384,7 +494,7 @@ export async function uploadShortToYoutubeChannel(
 
           const uploaded = (await putRes.json()) as { id?: string };
           if (uploaded.id) {
-            // Aplica a thumbnail capturada pelo Editor no video publicado (YouTube Data API thumbnails.set)
+            // Aplica a thumbnail capturada pelo Editor no video publicado/agendado (YouTube Data API thumbnails.set)
             const resolvedThumb = await resolveThumbnailJpegBufferForUpload(params);
             const thumbnailApplied = resolvedThumb.buffer
               ? await tryUploadYoutubeVideoThumbnail({
@@ -394,11 +504,17 @@ export async function uploadShortToYoutubeChannel(
                 })
               : false;
 
-            const livePlan = planYoutubeShortPublication({
+            const livePlan = planYoutubeConsistencySchedule({
               videoIndex: params.videoIndex,
-              alreadyPublishedTodayCount: params.alreadyPublishedTodayCount,
+              officeCreatedAtIso,
+              existingScheduledDatesIso,
+              alreadyUploadedApiTodayCount,
               videoId: uploaded.id,
             });
+            if (livePlan.scheduleDetails && params.consistencyAnalysis?.trim()) {
+              livePlan.scheduleDetails.consistency_analysis = params.consistencyAnalysis.trim();
+            }
+
             return {
               youtubeVideoId: uploaded.id,
               url: livePlan.shortUrl,
@@ -407,12 +523,12 @@ export async function uploadShortToYoutubeChannel(
               tags: finalTags,
               thumbnailPath: resolvedThumb.storagePath,
               thumbnailApplied,
-              visibility: params.visibility,
-              publicationStatus: 'published',
+              visibility: isScheduledFuturePost ? 'private' : params.visibility,
+              publicationStatus: livePlan.publicationStatus,
               scheduledAt,
               quotaUnitsConsumed: livePlan.quotaUnitsConsumed,
               dailyQuotaLimitVideos: livePlan.dailyQuotaLimitVideos,
-              scheduleDetails: null,
+              scheduleDetails: livePlan.scheduleDetails,
               outputSummary: livePlan.outputSummary,
               mode: 'youtube_data_api_v3',
             };
@@ -436,13 +552,16 @@ export async function uploadShortToYoutubeChannel(
     tags: finalTags,
     thumbnailPath: defaultThumbPath,
     thumbnailApplied: Boolean(params.thumbnailBuffer || params.thumbnailPath),
-    visibility: params.visibility,
-    publicationStatus: 'published',
+    visibility: isScheduledFuturePost ? 'private' : params.visibility,
+    publicationStatus: plan.publicationStatus,
     scheduledAt,
     quotaUnitsConsumed: plan.quotaUnitsConsumed,
     dailyQuotaLimitVideos: plan.dailyQuotaLimitVideos,
-    scheduleDetails: null,
-    outputSummary: `[MODO SANDBOX — Salve Client ID, Client Secret e Refresh Token reais no Cofre do Escritório para publicar no YouTube real] URL Simulada: ${plan.shortUrl}`,
+    scheduleDetails: plan.scheduleDetails,
+    outputSummary:
+      plan.publicationStatus === 'scheduled'
+        ? plan.outputSummary
+        : `[MODO SANDBOX — Salve Client ID, Client Secret e Refresh Token reais no Cofre do Escritório para publicar no YouTube real] URL Simulada: ${plan.shortUrl}`,
     mode: 'sandbox_channel',
   };
 }

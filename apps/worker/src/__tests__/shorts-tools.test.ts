@@ -128,7 +128,24 @@ describe('@workoffice/worker — Etapa 6 (Tools Reais de Pesquisa, Edicao 9:16/S
     expect(uploaded.publicationStatus).toBe('published');
     expect(uploaded.outputSummary).toContain(uploaded.url);
 
-    // Quando o lote produz mais videos do que a cota diaria (> 6 videos/dia), o Publicador agenda a publicacao
+    // Mesmo dentro da cota tecnica de 6 uploads/dia da API, o 2o video recebido no mesmo dia
+    // ja e programado para o proximo dia pelo Plano de Constancia (1 Short/dia • 4-5/semana nas semanas 1-3)
+    const secondSameDay = await uploadShortToYoutubeChannel({
+      officeId: '11111111-1111-1111-1111-111111111111',
+      runId: '22222222-2222-2222-2222-222222222222',
+      videoIndex: 2,
+      title: 'Vídeo #2 — Constância Diária',
+      description: 'Segundo vídeo do lote programado para amanhã #shorts',
+      visibility: 'public',
+      mp4Buffer: pkg.mp4Buffer,
+    });
+    expect(secondSameDay.publicationStatus).toBe('scheduled');
+    expect(secondSameDay.scheduleDetails?.is_scheduled_due_to_consistency).toBe(true);
+    expect(secondSameDay.scheduleDetails?.day_offset).toBe(1);
+    expect(secondSameDay.scheduleDetails?.daily_posts_limit).toBe(1);
+    expect(secondSameDay.scheduleDetails?.weekly_posts_target).toBe(5);
+
+    // Quando o lote produz mais videos do que a cota diaria (> 6 videos/dia), o Publicador agenda e reserva cota
     const scheduledExcess = await uploadShortToYoutubeChannel({
       officeId: '11111111-1111-1111-1111-111111111111',
       runId: '22222222-2222-2222-2222-222222222222',
@@ -140,9 +157,9 @@ describe('@workoffice/worker — Etapa 6 (Tools Reais de Pesquisa, Edicao 9:16/S
     });
     expect(scheduledExcess.publicationStatus).toBe('scheduled');
     expect(scheduledExcess.scheduleDetails?.is_scheduled_due_to_quota).toBe(true);
-    expect(scheduledExcess.scheduleDetails?.day_offset).toBe(1);
-    expect(scheduledExcess.scheduleDetails?.slot_in_day).toBe(2);
-    expect(scheduledExcess.outputSummary).toContain('Agendamento Programado:');
+    expect(scheduledExcess.scheduleDetails?.is_scheduled_due_to_consistency).toBe(true);
+    expect(scheduledExcess.scheduleDetails?.channel_week_number).toBe(2);
+    expect(scheduledExcess.outputSummary).toContain('Agendamento');
 
     const metrics = await fetchShortAnalyticsSnapshot({
       youtubeVideoId: uploaded.youtubeVideoId,
@@ -240,9 +257,10 @@ Outside clip after end
     });
     expect(ass).toContain('[Script Info]');
     expect(ass).toContain('PlayResX: 1080');
-    expect(ass).toContain('\\fscx91'); // pop
-    expect(ass).toContain('\\move('); // fade_slide
-    expect(ass).toContain('\\blur3.5'); // blur_in
+    expect(ass).toContain('\\fscx78'); // CapCut pop bounce transition
+    expect(ass).toContain('\\move('); // CapCut slide-up transition
+    expect(ass).toContain('\\blur3.5'); // CapCut zoom-glow transition
+    expect(ass).not.toContain('{\\r}'); // Nunca usa {\r} que reseta \pos e \move no libass
     expect(ass).toContain('DESTAQUE');
 
     const sigArgs = buildFfmpegSignatureEditArgs({
