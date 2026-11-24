@@ -384,7 +384,7 @@ export async function recordWorkerHeartbeat(
     processed_tasks: processedTasks,
     last_seen_at: new Date().toISOString(),
     metadata: {
-      worker_version: '2026.11.24-balanced-framing-editor-v12',
+      worker_version: '2026.11.24-embed-session-stream-cache-v13',
       git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || 'local',
       railway_deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || null,
       node_version: process.version,

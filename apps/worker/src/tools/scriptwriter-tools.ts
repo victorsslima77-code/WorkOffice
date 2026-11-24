@@ -74,68 +74,67 @@ export function extractDirectYoutubeVideoIdFromText(rawText: string): string | n
   return match?.[1] ?? null;
 }
 
+const watchSignalsCacheByVideoId = new Map<
+  string,
+  {
+    videoId: string | null;
+    title?: string;
+    channelTitle?: string;
+    description: string | null;
+    durationSec: number | null;
+    heatmapBuckets: HeatmapBucket[];
+    fetchedAtMs: number;
+  }
+>();
+
+const heatmapCacheByVideoId = new Map<string, YoutubeAudienceHeatmap>();
+
 /**
  * Busca os metadados reais de um video especifico do YouTube quando o usuario informa a URL direta na instrucao.
+ * Prioriza a YouTube Data API v3 oficial (OAuth) e o HTML `/watch` cacheado, evitando chamadas desnecessarias ao `/youtubei/v1/player`.
  */
 export async function fetchDirectYoutubeVideoCandidate(
   videoId: string,
+  oauth?: YoutubeOAuthCredentials | null,
 ): Promise<CandidatePodcastVideo | null> {
   if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return null;
   const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  try {
-    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent':
-          'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
-      },
-      body: JSON.stringify({
-        context: {
-          client: {
-            clientName: 'IOS',
-            clientVersion: '20.10.4',
-            deviceMake: 'Apple',
-            deviceModel: 'iPhone16,2',
-            osName: 'iPhone',
-            osVersion: '18.3.2.22D82',
-            hl: 'pt',
-            gl: 'BR',
-          },
-        },
-        videoId,
-      }),
-      signal: AbortSignal.timeout(8_000),
-    });
-
-    if (res.ok) {
-      const data = (await res.json()) as {
-        videoDetails?: {
-          videoId?: string;
-          title?: string;
-          author?: string;
-          lengthSeconds?: string;
-          viewCount?: string;
-          shortDescription?: string;
-        };
-      };
-      const vd = data.videoDetails;
-      if (vd?.title) {
-        return {
-          videoId,
-          url: watchUrl,
-          title: vd.title,
-          channelTitle: vd.author ?? 'YouTube',
-          publishedAt: new Date().toISOString(),
-          durationSec: Math.max(60, Number(vd.lengthSeconds ?? 600)),
-          viewCount: Number(vd.viewCount ?? 0),
-          description: (vd.shortDescription ?? '').slice(0, 500),
-        };
+  if (oauth?.refreshToken) {
+    try {
+      const tokenInfo = await exchangeYoutubeRefreshToken(oauth);
+      if (!tokenInfo.isSandbox) {
+        const apiRes = await fetch(
+          `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,statistics&id=${encodeURIComponent(videoId)}`,
+          { headers: { Authorization: `Bearer ${tokenInfo.accessToken}` } },
+        );
+        if (apiRes.ok) {
+          const apiData = (await apiRes.json()) as {
+            items?: {
+              snippet?: { title?: string; channelTitle?: string; description?: string; publishedAt?: string };
+              contentDetails?: { duration?: string };
+              statistics?: { viewCount?: string };
+            }[];
+          };
+          const item = apiData.items?.[0];
+          if (item?.snippet?.title) {
+            return {
+              videoId,
+              url: watchUrl,
+              title: item.snippet.title,
+              channelTitle: item.snippet.channelTitle ?? 'YouTube',
+              publishedAt: item.snippet.publishedAt ?? new Date().toISOString(),
+              durationSec:
+                parseIso8601DurationToSec(item.contentDetails?.duration) ?? 600,
+              viewCount: Number(item.statistics?.viewCount ?? 0),
+              description: (item.snippet.description ?? '').slice(0, 500),
+            };
+          }
+        }
       }
+    } catch {
+      // Fallback para watch HTML abaixo
     }
-  } catch {
-    // Fallback para watch HTML abaixo
   }
 
   const signals = await fetchYoutubeWatchPageSignals(watchUrl);
@@ -143,8 +142,8 @@ export async function fetchDirectYoutubeVideoCandidate(
     return {
       videoId,
       url: watchUrl,
-      title: `Vídeo YouTube (${videoId})`,
-      channelTitle: 'YouTube',
+      title: signals.title ?? `Vídeo YouTube (${videoId})`,
+      channelTitle: signals.channelTitle ?? 'YouTube',
       publishedAt: new Date().toISOString(),
       durationSec: signals.durationSec ?? 600,
       description: signals.description ?? '',
@@ -517,7 +516,7 @@ export async function searchTrendingTopicsForScriptwriter(
   // 0. Se o usuario informou um link direto de video do YouTube na instrucao, usa esse video imediatamente!
   const directVideoId = extractDirectYoutubeVideoIdFromText(cleanQuery);
   if (directVideoId) {
-    const directVideo = await fetchDirectYoutubeVideoCandidate(directVideoId);
+    const directVideo = await fetchDirectYoutubeVideoCandidate(directVideoId, oauth);
     if (directVideo) {
       return {
         query: cleanQuery,
@@ -666,7 +665,7 @@ export async function listChannelOrTopicVideos(
     extractDirectYoutubeVideoIdFromText(topic) ??
     extractDirectYoutubeVideoIdFromText(channelOrTopicUrl);
   if (directId) {
-    const directCandidate = await fetchDirectYoutubeVideoCandidate(directId);
+    const directCandidate = await fetchDirectYoutubeVideoCandidate(directId, oauth);
     if (directCandidate) {
       return [directCandidate];
     }
@@ -898,19 +897,27 @@ export function selectPeakAudienceClips(
 }
 
 /**
- * Extrai a pagina watch do YouTube uma unica vez (trazendo descricao, duracao real e heatmap de audiencia).
+ * Extrai a pagina watch do YouTube uma unica vez por videoId (com cache de 25 min),
+ * trazendo titulo, canal, descricao, duracao real e heatmap de audiencia.
  */
 async function fetchYoutubeWatchPageSignals(sourceUrl: string): Promise<{
   videoId: string | null;
+  title?: string;
+  channelTitle?: string;
   description: string | null;
   durationSec: number | null;
   heatmapBuckets: HeatmapBucket[];
 }> {
-  const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   if (!idMatch?.[1]) {
     return { videoId: null, description: null, durationSec: null, heatmapBuckets: [] };
   }
   const videoId = idMatch[1];
+
+  const cached = watchSignalsCacheByVideoId.get(videoId);
+  if (cached && Date.now() - cached.fetchedAtMs < 25 * 60_000) {
+    return cached;
+  }
 
   try {
     const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
@@ -918,6 +925,7 @@ async function fetchYoutubeWatchPageSignals(sourceUrl: string): Promise<{
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        Cookie: 'CONSENT=YES+cb.20210328-17-p0.en+FX+999',
       },
       signal: AbortSignal.timeout(9_000),
     });
@@ -938,11 +946,32 @@ async function fetchYoutubeWatchPageSignals(sourceUrl: string): Promise<{
       }
     }
 
+    const titleMatch = html.match(/"videoDetails":\{[^}]*?"title":"((?:[^"\\]|\\.)*)"/);
+    const authorMatch = html.match(/"videoDetails":\{[^}]*?"author":"((?:[^"\\]|\\.)*)"/);
+    let title: string | undefined;
+    let channelTitle: string | undefined;
+    try {
+      if (titleMatch?.[1]) title = JSON.parse(`"${titleMatch[1]}"`) as string;
+      if (authorMatch?.[1]) channelTitle = JSON.parse(`"${authorMatch[1]}"`) as string;
+    } catch {
+      // ignora
+    }
+
     const lenMatch = html.match(/"lengthSeconds":"(\d+)"/);
     const durationSec = lenMatch?.[1] ? Number(lenMatch[1]) : null;
     const heatmapBuckets = parseHeatmapBucketsFromYoutubeJson(html);
 
-    return { videoId, description, durationSec, heatmapBuckets };
+    const entry = {
+      videoId,
+      title,
+      channelTitle,
+      description,
+      durationSec,
+      heatmapBuckets,
+      fetchedAtMs: Date.now(),
+    };
+    watchSignalsCacheByVideoId.set(videoId, entry);
+    return entry;
   } catch {
     return { videoId, description: null, durationSec: null, heatmapBuckets: [] };
   }
@@ -950,7 +979,7 @@ async function fetchYoutubeWatchPageSignals(sourceUrl: string): Promise<{
 
 /**
  * Camada 2 de Heatmap: consulta o endpoint InnerTube `/youtubei/v1/next` para obter
- * os marcadores `MARKER_TYPE_HEATMAP` (Most Replayed) diretamente do YouTube.
+ * os marcadores `MARKER_TYPE_HEATMAP` (Most Replayed) diretamente do YouTube (sem tocar no endpoint `/player`!).
  */
 async function fetchHeatmapViaInnertubeNext(videoId: string): Promise<HeatmapBucket[]> {
   try {
@@ -960,6 +989,7 @@ async function fetchHeatmapViaInnertubeNext(videoId: string): Promise<HeatmapBuc
         'Content-Type': 'application/json',
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Cookie: 'CONSENT=YES+cb.20210328-17-p0.en+FX+999',
       },
       body: JSON.stringify({
         context: {
@@ -983,57 +1013,10 @@ async function fetchHeatmapViaInnertubeNext(videoId: string): Promise<HeatmapBuc
 }
 
 /**
- * Camada 3 de Heatmap: consulta `yt-dlp --dump-single-json --skip-download` (disponivel no container Railway)
- * que devolve o array `heatmap: [{ start_time, end_time, value }]` e a duracao exata do video.
- */
-async function fetchHeatmapViaYtDlp(
-  sourceUrl: string,
-): Promise<{ buckets: HeatmapBucket[]; durationSec?: number }> {
-  try {
-    const { stdout } = await execFileAsync(
-      'yt-dlp',
-      [
-        '--no-playlist',
-        '--skip-download',
-        '--dump-single-json',
-        '--no-warnings',
-        '--extractor-args',
-        'youtube:player_client=web',
-        sourceUrl,
-      ],
-      { timeout: 15_000, maxBuffer: 6 * 1024 * 1024 },
-    );
-    const parsed = JSON.parse(stdout) as {
-      duration?: number;
-      heatmap?: { start_time?: number; end_time?: number; value?: number }[];
-    };
-    const buckets: HeatmapBucket[] = (parsed.heatmap ?? [])
-      .filter(
-        (h) =>
-          typeof h.start_time === 'number' &&
-          typeof h.end_time === 'number' &&
-          typeof h.value === 'number' &&
-          h.end_time > h.start_time,
-      )
-      .map((h) => ({
-        startSec: Number(h.start_time!.toFixed(2)),
-        endSec: Number(h.end_time!.toFixed(2)),
-        intensity: Math.min(1, Math.max(0, h.value!)),
-      }));
-    return {
-      buckets,
-      durationSec: typeof parsed.duration === 'number' ? Math.round(parsed.duration) : undefined,
-    };
-  } catch {
-    return { buckets: [] };
-  }
-}
-
-/**
- * Busca os pontos reais de pico de audiencia ("Most Replayed") de um video do YouTube em 3 camadas:
+ * Busca os pontos reais de pico de audiencia ("Most Replayed") de um video do YouTube com cache em memoria:
  * 1) HTML da pagina watch?v=<id>
  * 2) YouTube InnerTube `/youtubei/v1/next`
- * 3) `yt-dlp --dump-single-json`
+ * IMPORTANTE: Nao invoca `yt-dlp` durante a fase do Pesquisador para nao consumir a cota de IP do endpoint `/player` antes do Editor baixar o video!
  */
 export async function fetchYoutubeAudienceHeatmap(
   sourceUrl: string,
@@ -1044,47 +1027,52 @@ export async function fetchYoutubeAudienceHeatmap(
     heatmapBuckets: HeatmapBucket[];
   },
 ): Promise<YoutubeAudienceHeatmap> {
-  const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   const videoId = preFetchedWatchSignals?.videoId ?? idMatch?.[1] ?? '';
 
   if (!videoId || process.env.VITEST === 'true') {
     return { videoId, source: 'none', peaks: [], durationSec: fallbackDurationSec };
   }
 
+  const cachedHeatmap = heatmapCacheByVideoId.get(videoId);
+  if (cachedHeatmap) {
+    return cachedHeatmap;
+  }
+
   const watchSignals = preFetchedWatchSignals ?? (await fetchYoutubeWatchPageSignals(sourceUrl));
   const resolvedDur = watchSignals.durationSec ?? fallbackDurationSec ?? 600;
 
   if (watchSignals.heatmapBuckets.length > 0) {
-    return {
+    const res: YoutubeAudienceHeatmap = {
       videoId,
       source: 'youtube_watch_heatmap',
       peaks: selectPeakAudienceClips(watchSignals.heatmapBuckets, resolvedDur, 3),
       durationSec: resolvedDur,
     };
+    heatmapCacheByVideoId.set(videoId, res);
+    return res;
   }
 
   const innertubeBuckets = await fetchHeatmapViaInnertubeNext(videoId);
   if (innertubeBuckets.length > 0) {
-    return {
+    const res: YoutubeAudienceHeatmap = {
       videoId,
       source: 'youtube_innertube_next',
       peaks: selectPeakAudienceClips(innertubeBuckets, resolvedDur, 3),
       durationSec: resolvedDur,
     };
+    heatmapCacheByVideoId.set(videoId, res);
+    return res;
   }
 
-  const ytdlpRes = await fetchHeatmapViaYtDlp(sourceUrl);
-  if (ytdlpRes.buckets.length > 0) {
-    const finalDur = ytdlpRes.durationSec ?? resolvedDur;
-    return {
-      videoId,
-      source: 'yt_dlp_heatmap',
-      peaks: selectPeakAudienceClips(ytdlpRes.buckets, finalDur, 3),
-      durationSec: finalDur,
-    };
-  }
-
-  return { videoId, source: 'none', peaks: [], durationSec: resolvedDur };
+  const emptyRes: YoutubeAudienceHeatmap = {
+    videoId,
+    source: 'none',
+    peaks: [],
+    durationSec: resolvedDur,
+  };
+  heatmapCacheByVideoId.set(videoId, emptyRes);
+  return emptyRes;
 }
 
 export async function extractBestTranscriptWindowForShort(

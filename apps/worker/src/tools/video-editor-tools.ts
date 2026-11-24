@@ -708,27 +708,110 @@ const YOUTUBE_IOS_CLIENT_CONTEXT = {
   gl: 'BR',
 };
 
+interface YoutubeEmbedVisitorSession {
+  visitorData?: string;
+  cookieHeader: string;
+  fetchedAtMs: number;
+}
+
+interface CachedResolvedStreams {
+  videoUrl: string;
+  audioUrl?: string;
+  userAgent: string;
+  cookieHeader: string;
+  defaultLanguage?: string;
+  expiresAtMs: number;
+}
+
+const embedSessionCacheByVideoId = new Map<string, YoutubeEmbedVisitorSession>();
+const resolvedStreamCacheByVideoId = new Map<string, CachedResolvedStreams>();
+const languageCacheByVideoId = new Map<string, string>();
+
+/**
+ * Inicializa uma sessao valida via `/embed/<videoId>` (que nunca exige login)
+ * capturando os cookies de sessao (`VISITOR_INFO1_LIVE`, `YSC`, `PREF`) e o token `VISITOR_DATA`
+ * para autenticar chamadas subsequentes ao InnerTube e ao yt-dlp em IPs de datacenter (Railway).
+ */
+async function fetchYoutubeEmbedVisitorSession(
+  videoId: string,
+  forceRefresh = false,
+): Promise<YoutubeEmbedVisitorSession> {
+  const cached = embedSessionCacheByVideoId.get(videoId);
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAtMs < 25 * 60_000) {
+    return cached;
+  }
+
+  const baseCookie = 'CONSENT=YES+cb.20210328-17-p0.en+FX+999';
+  try {
+    const embedRes = await fetch(`https://www.youtube.com/embed/${videoId}?hl=pt&gl=BR`, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Referer: 'https://www.google.com/',
+        Cookie: baseCookie,
+      },
+      signal: AbortSignal.timeout(8_000),
+    });
+
+    const getSetCookieFn = (
+      embedRes.headers as unknown as { getSetCookie?: () => string[] }
+    ).getSetCookie;
+    const rawCookies = typeof getSetCookieFn === 'function' ? getSetCookieFn.call(embedRes.headers) : [];
+    const cookiePairs = [
+      baseCookie,
+      ...rawCookies.map((c) => c.split(';')[0]?.trim()).filter(Boolean),
+    ];
+    const html = await embedRes.text();
+    const visitorData = html.match(/"VISITOR_DATA":"([^"]+)"/)?.[1];
+
+    const session: YoutubeEmbedVisitorSession = {
+      visitorData,
+      cookieHeader: Array.from(new Set(cookiePairs)).join('; '),
+      fetchedAtMs: Date.now(),
+    };
+    embedSessionCacheByVideoId.set(videoId, session);
+    return session;
+  } catch {
+    return {
+      cookieHeader: baseCookie,
+      fetchedAtMs: Date.now(),
+    };
+  }
+}
+
 /**
  * Detecta o idioma falado ORIGINAL do video no YouTube (ex: "pt", "en", "es")
- * inspecionando a faixa ASR (auto-generated) do InnerTube IOS player (que nao sofre bloqueio de PO Token em datacenter).
+ * usando o cache de stream ou a sessao `/embed` + InnerTube IOS.
  * Nunca traduz: garante que videos em portugues fiquem em portugues e em ingles fiquem em ingles.
  */
 export async function detectYoutubeOriginalLanguage(sourceUrl: string): Promise<string | null> {
   const idMatch = sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   if (!idMatch?.[1]) return null;
+  const videoId = idMatch[1];
+
+  const cachedLang = languageCacheByVideoId.get(videoId);
+  if (cachedLang) return cachedLang;
 
   try {
+    const session = await fetchYoutubeEmbedVisitorSession(videoId);
     const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': YOUTUBE_IOS_USER_AGENT,
+        Cookie: session.cookieHeader,
+        ...(session.visitorData ? { 'X-Goog-Visitor-Id': session.visitorData } : {}),
       },
       body: JSON.stringify({
         context: {
-          client: YOUTUBE_IOS_CLIENT_CONTEXT,
+          client: {
+            ...YOUTUBE_IOS_CLIENT_CONTEXT,
+            ...(session.visitorData ? { visitorData: session.visitorData } : {}),
+          },
         },
-        videoId: idMatch[1],
+        videoId,
+        contentCheckOk: true,
+        racyCheckOk: true,
       }),
       signal: AbortSignal.timeout(8_000),
     });
@@ -748,7 +831,11 @@ export async function detectYoutubeOriginalLanguage(sourceUrl: string): Promise<
     // A faixa `kind === 'asr'` sempre representa o idioma real do audio original falado no video!
     const asrTrack = tracks.find((t) => t.kind === 'asr' && t.languageCode);
     const rawLang = asrTrack?.languageCode ?? tracks[0]?.languageCode ?? null;
-    return rawLang ? rawLang.split('-')[0]!.toLowerCase() : null;
+    const normalized = rawLang ? rawLang.split('-')[0]!.toLowerCase() : null;
+    if (normalized) {
+      languageCacheByVideoId.set(videoId, normalized);
+    }
+    return normalized;
   } catch {
     return null;
   }
@@ -756,7 +843,7 @@ export async function detectYoutubeOriginalLanguage(sourceUrl: string): Promise<
 
 /**
  * Monta os argumentos reais do `yt-dlp` para baixar apenas o segmento especifico (start-end)
- * priorizando clientes IOS/MWEB/TV e suportando streams DASH (bestvideo+bestaudio) com merge para MP4.
+ * priorizando clientes IOS/MWEB/TV, injetando visitor_data + cookies da sessao /embed e suportando streams DASH.
  */
 export function buildYtDlpSegmentArgs(params: {
   sourceUrl: string;
@@ -764,32 +851,130 @@ export function buildYtDlpSegmentArgs(params: {
   endSec: number;
   outputTemplatePath: string;
   playerClients?: string;
+  visitorData?: string;
+  cookieHeader?: string;
 }): string[] {
   validateSafeExternalUrl(params.sourceUrl, { enforceAllowedMediaHost: true });
   validateShortClipDuration(params.startSec, params.endSec);
 
   const clients = params.playerClients ?? 'ios,mweb,tv_embedded,android,web';
+  const extractorArg = params.visitorData
+    ? `youtube:player_client=${clients};visitor_data=${params.visitorData}`
+    : `youtube:player_client=${clients}`;
 
-  return [
+  const args: string[] = [
     '--no-playlist',
     '--extractor-args',
-    `youtube:player_client=${clients}`,
+    extractorArg,
     '--download-sections',
     `*${params.startSec}-${params.endSec}`,
     '-f',
     'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best[height<=1080]/best',
     '--merge-output-format',
     'mp4',
-    '-o',
-    params.outputTemplatePath,
-    params.sourceUrl,
   ];
+
+  if (params.cookieHeader) {
+    args.push('--add-header', `Cookie:${params.cookieHeader}`);
+  }
+
+  args.push('-o', params.outputTemplatePath, params.sourceUrl);
+  return args;
+}
+
+async function runFfmpegSliceFromStreamUrls(params: {
+  videoUrl: string;
+  audioUrl?: string;
+  userAgent: string;
+  cookieHeader?: string;
+  startSec: number;
+  clipDuration: number;
+  outputPath: string;
+}): Promise<boolean> {
+  const headerArgs = params.cookieHeader
+    ? ['-headers', `Cookie: ${params.cookieHeader}\r\n`]
+    : [];
+
+  const ffArgs: string[] = params.audioUrl
+    ? [
+        '-y',
+        '-user_agent',
+        params.userAgent,
+        ...headerArgs,
+        '-ss',
+        String(params.startSec),
+        '-t',
+        String(params.clipDuration),
+        '-i',
+        params.videoUrl,
+        '-user_agent',
+        params.userAgent,
+        ...headerArgs,
+        '-ss',
+        String(params.startSec),
+        '-t',
+        String(params.clipDuration),
+        '-i',
+        params.audioUrl,
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        '20',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ar',
+        '44100',
+        '-shortest',
+        params.outputPath,
+      ]
+    : [
+        '-y',
+        '-user_agent',
+        params.userAgent,
+        ...headerArgs,
+        '-ss',
+        String(params.startSec),
+        '-t',
+        String(params.clipDuration),
+        '-i',
+        params.videoUrl,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        '20',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ar',
+        '44100',
+        params.outputPath,
+      ];
+
+  await execFileAsync('ffmpeg', ffArgs, { timeout: 65_000 });
+  const stat = await fs.stat(params.outputPath).catch(() => null);
+  return Boolean(stat && stat.size > 4096);
 }
 
 /**
- * Camada 1 Direta (Anti-Bloqueio de Datacenter):
- * Consulta a API InnerTube com o cliente IOS (que entrega `adaptiveFormats` H.264 1080p + AAC M4A com HTTP 206 Range sem exigir PO Token)
- * e recorta diretamente o intervalo [startSec, endSec] via `ffmpeg` com timestamps PTS normalizados em t=0!
+ * Camada 1 Direta (Anti-Bloqueio de Datacenter + Cache de Stream por 40 min):
+ * Inicializa sessao de cookies + VISITOR_DATA via `/embed/<videoId>`, consulta InnerTube (`IOS` / `ANDROID_VR` / `MWEB`),
+ * faz cache das URLs de stream `googlevideo.com` (validas por 6h) para reutilizar em multiplos cortes do mesmo video
+ * sem bater novamente no YouTube, e recorta [startSec, endSec] via `ffmpeg` com PTS=0!
  */
 async function tryDownloadSegmentViaInnertubeIosAndFfmpeg(params: {
   sourceUrl: string;
@@ -804,170 +989,262 @@ async function tryDownloadSegmentViaInnertubeIosAndFfmpeg(params: {
   const videoId = idMatch[1];
   const clipDuration = validateShortClipDuration(params.startSec, params.endSec);
 
-  try {
-    const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': YOUTUBE_IOS_USER_AGENT,
+  // 0. Verifica se ja temos as URLs de stream desse videoId em cache na memoria do worker (evita chamar /player repetidamente!)
+  const cachedStream = resolvedStreamCacheByVideoId.get(videoId);
+  if (cachedStream && cachedStream.expiresAtMs > Date.now()) {
+    try {
+      const slicedOk = await runFfmpegSliceFromStreamUrls({
+        videoUrl: cachedStream.videoUrl,
+        audioUrl: cachedStream.audioUrl,
+        userAgent: cachedStream.userAgent,
+        cookieHeader: cachedStream.cookieHeader,
+        startSec: params.startSec,
+        clipDuration,
+        outputPath: params.outputPath,
+      });
+      if (slicedOk) {
+        return { ok: true };
+      }
+    } catch {
+      resolvedStreamCacheByVideoId.delete(videoId);
+    }
+  }
+
+  const clientConfigs = [
+    {
+      label: 'IOS',
+      userAgent: YOUTUBE_IOS_USER_AGENT,
+      clientCtx: YOUTUBE_IOS_CLIENT_CONTEXT,
+    },
+    {
+      label: 'ANDROID_VR',
+      userAgent:
+        'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      clientCtx: {
+        clientName: 'ANDROID_VR',
+        clientVersion: '1.60.19',
+        androidSdkVersion: 32,
+        osName: 'Android',
+        osVersion: '12L',
+        hl: 'pt',
+        gl: 'BR',
       },
-      body: JSON.stringify({
-        context: {
-          client: YOUTUBE_IOS_CLIENT_CONTEXT,
+    },
+  ];
+
+  let lastReason = 'InnerTube nao retornou streams';
+
+  for (let attempt = 0; attempt < clientConfigs.length; attempt++) {
+    const cfg = clientConfigs[attempt]!;
+    try {
+      const session = await fetchYoutubeEmbedVisitorSession(videoId, attempt > 0);
+      const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': cfg.userAgent,
+          Cookie: session.cookieHeader,
+          ...(session.visitorData ? { 'X-Goog-Visitor-Id': session.visitorData } : {}),
         },
-        videoId,
-      }),
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!res.ok) {
-      return { ok: false, reason: `InnerTube IOS HTTP ${res.status}` };
-    }
-
-    const data = (await res.json()) as {
-      playabilityStatus?: { status?: string; reason?: string };
-      streamingData?: {
-        hlsManifestUrl?: string;
-        formats?: {
-          url?: string;
-          mimeType?: string;
-          height?: number;
-          bitrate?: number;
-        }[];
-        adaptiveFormats?: {
-          url?: string;
-          mimeType?: string;
-          height?: number;
-          bitrate?: number;
-        }[];
-      };
-    };
-
-    if (data.playabilityStatus?.status !== 'OK') {
-      return {
-        ok: false,
-        reason: `InnerTube IOS status=${data.playabilityStatus?.status ?? 'UNKNOWN'} (${data.playabilityStatus?.reason ?? ''})`,
-      };
-    }
-
-    const adaptive = data.streamingData?.adaptiveFormats ?? [];
-    const muxed = data.streamingData?.formats ?? [];
-
-    // Prioriza H.264 (avc1) <= 1080p para recorte rapido e 100% compativel
-    const videoCandidates = adaptive
-      .filter((f) => f.url && f.mimeType?.includes('video/mp4') && (f.height ?? 0) <= 1080)
-      .sort((a, b) => {
-        const aAvc = a.mimeType?.includes('avc1') ? 1 : 0;
-        const bAvc = b.mimeType?.includes('avc1') ? 1 : 0;
-        if (aAvc !== bAvc) return bAvc - aAvc;
-        return (b.height ?? 0) - (a.height ?? 0);
+        body: JSON.stringify({
+          context: {
+            client: {
+              ...cfg.clientCtx,
+              ...(session.visitorData ? { visitorData: session.visitorData } : {}),
+            },
+          },
+          videoId,
+          contentCheckOk: true,
+          racyCheckOk: true,
+        }),
+        signal: AbortSignal.timeout(10_000),
       });
 
-    const audioCandidates = adaptive
-      .filter((f) => f.url && (f.mimeType?.includes('audio/mp4') || f.mimeType?.includes('audio/webm')))
-      .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
-
-    const bestVideo = videoCandidates[0];
-    const bestAudio = audioCandidates[0];
-
-    if (bestVideo?.url && bestAudio?.url) {
-      await execFileAsync(
-        'ffmpeg',
-        [
-          '-y',
-          '-user_agent',
-          YOUTUBE_IOS_USER_AGENT,
-          '-ss',
-          String(params.startSec),
-          '-t',
-          String(clipDuration),
-          '-i',
-          bestVideo.url,
-          '-user_agent',
-          YOUTUBE_IOS_USER_AGENT,
-          '-ss',
-          String(params.startSec),
-          '-t',
-          String(clipDuration),
-          '-i',
-          bestAudio.url,
-          '-map',
-          '0:v:0',
-          '-map',
-          '1:a:0',
-          '-c:v',
-          'libx264',
-          '-preset',
-          'ultrafast',
-          '-crf',
-          '20',
-          '-pix_fmt',
-          'yuv420p',
-          '-c:a',
-          'aac',
-          '-b:a',
-          '128k',
-          '-ar',
-          '44100',
-          '-shortest',
-          params.outputPath,
-        ],
-        { timeout: 65_000 },
-      );
-
-      const stat = await fs.stat(params.outputPath).catch(() => null);
-      if (stat && stat.size > 4096) {
-        return { ok: true };
+      if (!res.ok) {
+        lastReason = `InnerTube ${cfg.label} HTTP ${res.status}`;
+        continue;
       }
-    }
 
-    // Fallback para stream muxed ou HLS manifest do IOS se adaptive nao estiver separado
-    const muxedOrHlsUrl = muxed.find((f) => f.url)?.url ?? data.streamingData?.hlsManifestUrl;
-    if (muxedOrHlsUrl) {
-      await execFileAsync(
-        'ffmpeg',
-        [
-          '-y',
-          '-user_agent',
-          YOUTUBE_IOS_USER_AGENT,
-          '-ss',
-          String(params.startSec),
-          '-t',
-          String(clipDuration),
-          '-i',
-          muxedOrHlsUrl,
-          '-c:v',
-          'libx264',
-          '-preset',
-          'ultrafast',
-          '-crf',
-          '20',
-          '-pix_fmt',
-          'yuv420p',
-          '-c:a',
-          'aac',
-          '-b:a',
-          '128k',
-          '-ar',
-          '44100',
-          params.outputPath,
-        ],
-        { timeout: 65_000 },
-      );
+      const data = (await res.json()) as {
+        playabilityStatus?: { status?: string; reason?: string };
+        captions?: {
+          playerCaptionsTracklistRenderer?: {
+            captionTracks?: { languageCode?: string; kind?: string }[];
+          };
+        };
+        streamingData?: {
+          hlsManifestUrl?: string;
+          formats?: {
+            url?: string;
+            mimeType?: string;
+            height?: number;
+            bitrate?: number;
+          }[];
+          adaptiveFormats?: {
+            url?: string;
+            mimeType?: string;
+            height?: number;
+            bitrate?: number;
+          }[];
+        };
+      };
 
-      const stat = await fs.stat(params.outputPath).catch(() => null);
-      if (stat && stat.size > 4096) {
-        return { ok: true };
+      // Aproveita a resposta do /player para guardar o idioma original real em cache (zero request extra em transcribe_audio!)
+      const tracks = data.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+      if (tracks.length > 0) {
+        const asrTrack = tracks.find((t) => t.kind === 'asr' && t.languageCode);
+        const rawLang = asrTrack?.languageCode ?? tracks[0]?.languageCode;
+        if (rawLang) {
+          languageCacheByVideoId.set(videoId, rawLang.split('-')[0]!.toLowerCase());
+        }
       }
-    }
 
-    return { ok: false, reason: 'InnerTube IOS nao retornou streams de video/audio validos.' };
-  } catch (err) {
-    return {
-      ok: false,
-      reason: (err as Error).message?.slice(-240) ?? 'Erro no download InnerTube IOS',
-    };
+      if (data.playabilityStatus?.status !== 'OK') {
+        lastReason = `InnerTube ${cfg.label} status=${data.playabilityStatus?.status ?? 'UNKNOWN'} (${data.playabilityStatus?.reason ?? ''})`;
+        continue;
+      }
+
+      const adaptive = data.streamingData?.adaptiveFormats ?? [];
+      const muxed = data.streamingData?.formats ?? [];
+
+      const videoCandidates = adaptive
+        .filter((f) => f.url && f.mimeType?.includes('video/mp4') && (f.height ?? 0) <= 1080)
+        .sort((a, b) => {
+          const aAvc = a.mimeType?.includes('avc1') ? 1 : 0;
+          const bAvc = b.mimeType?.includes('avc1') ? 1 : 0;
+          if (aAvc !== bAvc) return bAvc - aAvc;
+          return (b.height ?? 0) - (a.height ?? 0);
+        });
+
+      const audioCandidates = adaptive
+        .filter(
+          (f) => f.url && (f.mimeType?.includes('audio/mp4') || f.mimeType?.includes('audio/webm')),
+        )
+        .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+
+      const bestVideo = videoCandidates[0];
+      const bestAudio = audioCandidates[0];
+
+      if (bestVideo?.url && bestAudio?.url) {
+        resolvedStreamCacheByVideoId.set(videoId, {
+          videoUrl: bestVideo.url,
+          audioUrl: bestAudio.url,
+          userAgent: cfg.userAgent,
+          cookieHeader: session.cookieHeader,
+          expiresAtMs: Date.now() + 40 * 60_000,
+        });
+
+        const ok = await runFfmpegSliceFromStreamUrls({
+          videoUrl: bestVideo.url,
+          audioUrl: bestAudio.url,
+          userAgent: cfg.userAgent,
+          cookieHeader: session.cookieHeader,
+          startSec: params.startSec,
+          clipDuration,
+          outputPath: params.outputPath,
+        });
+        if (ok) return { ok: true };
+      }
+
+      const muxedOrHlsUrl = muxed.find((f) => f.url)?.url ?? data.streamingData?.hlsManifestUrl;
+      if (muxedOrHlsUrl) {
+        resolvedStreamCacheByVideoId.set(videoId, {
+          videoUrl: muxedOrHlsUrl,
+          userAgent: cfg.userAgent,
+          cookieHeader: session.cookieHeader,
+          expiresAtMs: Date.now() + 40 * 60_000,
+        });
+
+        const ok = await runFfmpegSliceFromStreamUrls({
+          videoUrl: muxedOrHlsUrl,
+          userAgent: cfg.userAgent,
+          cookieHeader: session.cookieHeader,
+          startSec: params.startSec,
+          clipDuration,
+          outputPath: params.outputPath,
+        });
+        if (ok) return { ok: true };
+      }
+    } catch (err) {
+      lastReason = (err as Error).message?.slice(-220) ?? `Erro InnerTube ${cfg.label}`;
+    }
   }
+
+  return { ok: false, reason: lastReason };
+}
+
+/**
+ * Camada de Contingencia via APIs Publicas Piped / Invidious:
+ * Caso o IP do Railway sofra rate-limit temporario nas chamadas diretas ao YouTube,
+ * busca os streams MP4/M4A/HLS em endpoints publicos abertos de mirror e recorta via ffmpeg.
+ */
+async function tryDownloadSegmentViaPublicStreamMirrors(params: {
+  sourceUrl: string;
+  startSec: number;
+  endSec: number;
+  outputPath: string;
+}): Promise<{ ok: boolean; reason?: string }> {
+  const idMatch = params.sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+  if (!idMatch?.[1]) return { ok: false };
+  const videoId = idMatch[1];
+  const clipDuration = validateShortClipDuration(params.startSec, params.endSec);
+  const browserUa =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+  const pipedEndpoints = [
+    `https://pipedapi.kavin.rocks/streams/${videoId}`,
+    `https://pipedapi.adminforge.de/streams/${videoId}`,
+    `https://api.piped.private.coffee/streams/${videoId}`,
+  ];
+
+  for (const endpoint of pipedEndpoints) {
+    try {
+      const res = await fetch(endpoint, {
+        headers: { 'User-Agent': browserUa, Accept: 'application/json' },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) continue;
+      const data = (await res.json()) as {
+        hls?: string;
+        videoStreams?: { url?: string; format?: string; height?: number; videoOnly?: boolean }[];
+        audioStreams?: { url?: string; format?: string; bitrate?: number }[];
+      };
+
+      const vStream = (data.videoStreams ?? [])
+        .filter((v) => v.url && (v.height ?? 0) <= 1080)
+        .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))[0];
+      const aStream = (data.audioStreams ?? [])
+        .filter((a) => a.url)
+        .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+
+      if (vStream?.url && aStream?.url) {
+        const ok = await runFfmpegSliceFromStreamUrls({
+          videoUrl: vStream.url,
+          audioUrl: aStream.url,
+          userAgent: browserUa,
+          startSec: params.startSec,
+          clipDuration,
+          outputPath: params.outputPath,
+        });
+        if (ok) return { ok: true };
+      }
+
+      if (data.hls) {
+        const ok = await runFfmpegSliceFromStreamUrls({
+          videoUrl: data.hls,
+          userAgent: browserUa,
+          startSec: params.startSec,
+          clipDuration,
+          outputPath: params.outputPath,
+        });
+        if (ok) return { ok: true };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { ok: false, reason: 'Mirrors publicos indisponiveis' };
 }
 
 function extractMeaningfulYtDlpError(err: unknown): string {
@@ -984,10 +1261,11 @@ function extractMeaningfulYtDlpError(err: unknown): string {
 }
 
 /**
- * Baixa o trecho real [startSec, endSec] do YouTube em cascata resiliente:
- * 1) Stream direto via InnerTube IOS + ffmpeg (imune ao bloqueio PO Token do cliente android e ja normaliza PTS=0)
- * 2) yt-dlp com clientes ios,mweb,tv_embedded e merge DASH bestvideo+bestaudio
- * 3) yt-dlp com clientes android,web
+ * Baixa o trecho real [startSec, endSec] do YouTube em cascata resiliente com cache persistente em `/tmp/wo-yt-media-cache`:
+ * 0) Cache local do container (`/tmp/wo-yt-media-cache/<videoId>_<startSec>_<endSec>.mp4`)
+ * 1) Stream direto via sessao `/embed` + InnerTube (`IOS` / `ANDROID_VR`) + cache de URLs de stream por 40 min
+ * 2) yt-dlp com visitor_data + cookies da sessao `/embed` (`ios,mweb,tv_embedded` e `android,web`)
+ * 3) Fallback via APIs publicas de stream mirror (Piped)
  */
 export async function downloadVideoSegmentToFile(params: {
   sourceUrl: string;
@@ -1007,13 +1285,43 @@ export async function downloadVideoSegmentToFile(params: {
     };
   }
 
-  // Camada 1: InnerTube IOS + ffmpeg Range (nao exige PO Token e ja entrega MP4 com PTS=0!)
+  const videoId =
+    params.sourceUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/)?.[1] ?? ' clip';
+  const cacheDir = path.join(os.tmpdir(), 'wo-yt-media-cache');
+  const cachedSegmentPath = path.join(
+    cacheDir,
+    `${videoId}_${params.startSec}_${params.endSec}.mp4`,
+  );
+
+  // Camada 0: Cache em disco do container Railway (se este trecho ja foi baixado antes, reutiliza instantaneamente!)
+  try {
+    const cachedStat = await fs.stat(cachedSegmentPath).catch(() => null);
+    if (cachedStat && cachedStat.size > 4096) {
+      await fs.copyFile(cachedSegmentPath, params.outputPath);
+      return { ok: true };
+    }
+  } catch {
+    // Segue para download
+  }
+
+  const saveToDiskCache = async () => {
+    try {
+      await fs.mkdir(cacheDir, { recursive: true });
+      await fs.copyFile(params.outputPath, cachedSegmentPath);
+    } catch {
+      // Cache best-effort
+    }
+  };
+
+  // Camada 1: Sessao `/embed` + InnerTube IOS/ANDROID_VR + cache de stream URLs + ffmpeg Range
   const iosResult = await tryDownloadSegmentViaInnertubeIosAndFfmpeg(params);
   if (iosResult.ok) {
+    await saveToDiskCache();
     return { ok: true };
   }
 
-  // Camada 2 e 3: yt-dlp com perfis de cliente variados
+  // Camada 2: yt-dlp com visitor_data + cookies da sessao `/embed`
+  const session = await fetchYoutubeEmbedVisitorSession(videoId);
   const clientProfiles = ['ios,mweb,tv_embedded', 'android,web'];
   let lastErrorReason = iosResult.reason ?? 'Erro desconhecido';
 
@@ -1026,6 +1334,8 @@ export async function downloadVideoSegmentToFile(params: {
         endSec: params.endSec,
         outputTemplatePath: params.outputPath,
         playerClients: profile,
+        visitorData: session.visitorData,
+        cookieHeader: session.cookieHeader,
       });
       await execFileAsync('yt-dlp', ytdlpArgs, { timeout: 75_000 });
       const stat = await fs.stat(params.outputPath).catch(() => null);
@@ -1067,6 +1377,7 @@ export async function downloadVideoSegmentToFile(params: {
         } catch {
           await fs.rm(normPath, { force: true }).catch(() => {});
         }
+        await saveToDiskCache();
         return { ok: true };
       }
       lastErrorReason = `Arquivo baixado pelo yt-dlp (${profile}) ficou vazio (< 4 KB).`;
@@ -1075,9 +1386,16 @@ export async function downloadVideoSegmentToFile(params: {
     }
   }
 
+  // Camada 3: Fallback via APIs publicas de stream mirror (Piped)
+  const mirrorResult = await tryDownloadSegmentViaPublicStreamMirrors(params);
+  if (mirrorResult.ok) {
+    await saveToDiskCache();
+    return { ok: true };
+  }
+
   return {
     ok: false,
-    reason: `${lastErrorReason} (InnerTube IOS: ${iosResult.reason ?? 'falhou'})`,
+    reason: `${lastErrorReason} (InnerTube: ${iosResult.reason ?? 'falhou'})`,
   };
 }
 
