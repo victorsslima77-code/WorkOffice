@@ -21,6 +21,7 @@ import {
   parseSubtitleTextToCues,
   remapCuesToEditSegments,
   renderShortVideoPackage,
+  selectM3u8SegmentsForTimeWindow,
   selectPeakAudienceClips,
   uploadShortToYoutubeChannel,
   validateSafeExternalUrl,
@@ -83,6 +84,31 @@ describe('@workoffice/worker — Etapa 6 (Tools Reais de Pesquisa, Edicao 9:16/S
     expect(customYtdlpArgs.join(' ')).toContain('tv,visionos,web_safari');
     expect(customYtdlpArgs).toContain('--cookies');
     expect(customYtdlpArgs).toContain('/tmp/wo-yt-cookies.txt');
+    expect(customYtdlpArgs.join(' ')).toContain('protocol*=m3u8');
+
+    const sampleM3u8 = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXTINF:5.0,',
+      'https://cdn.example.com/seg0.ts',
+      '#EXTINF:5.0,',
+      'https://cdn.example.com/seg1.ts',
+      '#EXTINF:5.0,',
+      'https://cdn.example.com/seg2.ts',
+      '#EXTINF:5.0,',
+      'https://cdn.example.com/seg3.ts',
+    ].join('\n');
+    const hlsWin = selectM3u8SegmentsForTimeWindow(
+      sampleM3u8,
+      'https://cdn.example.com/index.m3u8',
+      6,
+      13,
+    );
+    expect(hlsWin.windowStartPtsSec).toBe(5);
+    expect(hlsWin.segmentUrls).toEqual([
+      'https://cdn.example.com/seg1.ts',
+      'https://cdn.example.com/seg2.ts',
+    ]);
 
     expect(
       extractDirectYoutubeVideoIdFromText(

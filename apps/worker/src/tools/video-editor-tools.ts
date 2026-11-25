@@ -806,8 +806,8 @@ export async function detectYoutubeOriginalLanguage(sourceUrl: string): Promise<
 
 /**
  * Monta os argumentos reais do `yt-dlp` para baixar apenas o segmento especifico (start-end).
- * Por padrao (`default`), preserva os clientes nativos do `yt-dlp` (`tv`, `visionos`, `web_safari`)
- * habilitando `--js-runtimes node` para resolucao oficial `[jsc:node]` com `yt-dlp-ejs`.
+ * Prioriza streams HLS H.264 (`protocol*=m3u8` + `avc1`, que usam `/ratebypass/yes/` sem bloqueio de Range HTTP 403 em datacenter)
+ * antes de streams `https` DASH, habilitando `--js-runtimes node` (`yt-dlp-ejs`).
  */
 export function buildYtDlpSegmentArgs(params: {
   sourceUrl: string;
@@ -816,6 +816,7 @@ export function buildYtDlpSegmentArgs(params: {
   outputTemplatePath: string;
   playerClients?: string;
   cookiesFilePath?: string;
+  ffmpegLocation?: string;
 }): string[] {
   validateSafeExternalUrl(params.sourceUrl, { enforceAllowedMediaHost: true });
   validateShortClipDuration(params.startSec, params.endSec);
@@ -831,11 +832,15 @@ export function buildYtDlpSegmentArgs(params: {
     args.push('--cookies', params.cookiesFilePath);
   }
 
+  if (params.ffmpegLocation) {
+    args.push('--ffmpeg-location', params.ffmpegLocation);
+  }
+
   args.push(
     '--download-sections',
     `*${params.startSec}-${params.endSec}`,
     '-f',
-    'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best[height<=1080]/best',
+    'bestvideo[protocol*=m3u8][vcodec^=avc1][height<=1080]+bestaudio[protocol*=m3u8]/bestvideo[protocol*=m3u8][height<=1080]+bestaudio[protocol*=m3u8]/best[height<=720][ext=mp4]/bestvideo[vcodec^=avc1][height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best',
     '--merge-output-format',
     'mp4',
     '-o',
@@ -848,14 +853,327 @@ export function buildYtDlpSegmentArgs(params: {
 function extractMeaningfulYtDlpError(err: unknown): string {
   const e = err as { stderr?: string; message?: string };
   const raw = `${e.stderr ?? ''}\n${e.message ?? ''}`.trim();
-  const errorLines = raw
+  const lines = raw
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .filter((l) => l.startsWith('ERROR:'));
-  if (errorLines.length > 0) {
-    return errorLines.join(' | ').slice(0, 280);
+    .filter(Boolean);
+
+  const relevant: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (
+      line.startsWith('ERROR:') ||
+      /HTTP error \d+|403 Forbidden|blocked for security|Invalid data found/i.test(line)
+    ) {
+      if (i > 0 && lines[i - 1] && !lines[i - 1]!.startsWith('[debug]')) {
+        relevant.push(lines[i - 1]!);
+      }
+      relevant.push(line);
+    }
   }
-  return raw.slice(-280);
+  if (relevant.length > 0) {
+    return Array.from(new Set(relevant)).join(' | ').slice(-320);
+  }
+  return raw.slice(-320);
+}
+
+/**
+ * Faz o parse de uma playlist HLS `#EXTM3U` do YouTube e retorna apenas os segmentos `.ts`/fMP4
+ * que cobrem a janela `[startSec - 1, endSec + 1]`, alem do timestamp inicial exato do 1o segmento.
+ */
+export function selectM3u8SegmentsForTimeWindow(
+  m3u8Text: string,
+  baseM3u8Url: string,
+  startSec: number,
+  endSec: number,
+): {
+  initMapUrl: string | null;
+  windowStartPtsSec: number;
+  segmentUrls: string[];
+} {
+  const lines = m3u8Text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  let cursorSec = 0;
+  let pendingDurSec = 0;
+  let initMapUrl: string | null = null;
+  let windowStartPtsSec: number | null = null;
+  const segmentUrls: string[] = [];
+
+  const resolveUrl = (raw: string): string => {
+    try {
+      return new URL(raw, baseM3u8Url).toString();
+    } catch {
+      return raw;
+    }
+  };
+
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-MAP:')) {
+      const m = line.match(/URI="([^"]+)"/);
+      if (m?.[1]) initMapUrl = resolveUrl(m[1]);
+      continue;
+    }
+    if (line.startsWith('#EXTINF:')) {
+      const durStr = line.slice('#EXTINF:'.length).split(',')[0] ?? '0';
+      pendingDurSec = Number.parseFloat(durStr) || 0;
+      continue;
+    }
+    if (!line.startsWith('#')) {
+      const segStart = cursorSec;
+      const segEnd = cursorSec + pendingDurSec;
+      cursorSec = segEnd;
+      if (segEnd > Math.max(0, startSec - 0.5) && segStart < endSec + 0.5) {
+        if (windowStartPtsSec === null) {
+          windowStartPtsSec = segStart;
+        }
+        segmentUrls.push(resolveUrl(line));
+      }
+      pendingDurSec = 0;
+    }
+  }
+
+  return {
+    initMapUrl,
+    windowStartPtsSec: windowStartPtsSec ?? 0,
+    segmentUrls,
+  };
+}
+
+async function downloadHlsTimeWindowToLocalFile(params: {
+  m3u8Url: string;
+  headers: Record<string, string>;
+  startSec: number;
+  endSec: number;
+  destPath: string;
+}): Promise<{ windowStartPtsSec: number }> {
+  const cleanHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(params.headers)) {
+    if (v && k.toLowerCase() !== 'host') {
+      cleanHeaders[k] = v;
+    }
+  }
+
+  const plRes = await fetch(params.m3u8Url, {
+    headers: cleanHeaders,
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!plRes.ok) {
+    throw new Error(`HLS playlist HTTP ${plRes.status}`);
+  }
+  const m3u8Text = await plRes.text();
+  const parsed = selectM3u8SegmentsForTimeWindow(
+    m3u8Text,
+    params.m3u8Url,
+    params.startSec,
+    params.endSec,
+  );
+
+  if (parsed.segmentUrls.length === 0) {
+    throw new Error('Nenhum segmento HLS encontrado para o intervalo solicitado');
+  }
+
+  const allUrls = [
+    ...(parsed.initMapUrl ? [parsed.initMapUrl] : []),
+    ...parsed.segmentUrls,
+  ];
+
+  // Baixa os segmentos (~8 a 13 arquivos .ts de ~5s) em lotes controlados de 6 conexoes paralelas
+  const chunks: Buffer[] = [];
+  const batchSize = 6;
+  for (let i = 0; i < allUrls.length; i += batchSize) {
+    const batch = allUrls.slice(i, i + batchSize);
+    const batchBuffers = await Promise.all(
+      batch.map(async (segUrl) => {
+        const r = await fetch(segUrl, {
+          headers: cleanHeaders,
+          signal: AbortSignal.timeout(20_000),
+        });
+        if (!r.ok) {
+          throw new Error(`HLS segment HTTP ${r.status}`);
+        }
+        return Buffer.from(await r.arrayBuffer());
+      }),
+    );
+    chunks.push(...batchBuffers);
+  }
+
+  await fs.writeFile(params.destPath, Buffer.concat(chunks));
+  return { windowStartPtsSec: parsed.windowStartPtsSec };
+}
+
+/**
+ * Camada 1 Primaria (Zero Rede no FFmpeg — Imune a `ERROR: ffmpeg exited with code 1` na Railway!):
+ * 1) Usa `yt-dlp --js-runtimes node -J` para resolver os manifestos HLS H.264 (`m3u8_native` com `/ratebypass/yes/`).
+ * 2) Baixa via Node `fetch` APENAS os ~10 segmentos `.ts` do trecho `[startSec, endSec]` (funciona ate em lives/videos de 3h+!).
+ * 3) Executa o `ffmpeg` 100% OFFLINE sobre os arquivos `.ts` locais em `/tmp`, gerando MP4 H.264 + AAC com `PTS=0.000s`.
+ */
+async function tryDownloadSegmentViaYtDlpHlsSlicesAndLocalFfmpeg(params: {
+  sourceUrl: string;
+  startSec: number;
+  endSec: number;
+  outputPath: string;
+  cookiesFilePath?: string;
+}): Promise<{ ok: boolean; reason?: string }> {
+  const tempSliceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wo-hls-slice-'));
+  try {
+    const dumpArgs = [
+      '--no-playlist',
+      '--js-runtimes',
+      'node',
+      ...(params.cookiesFilePath ? ['--cookies', params.cookiesFilePath] : []),
+      '-J',
+      params.sourceUrl,
+    ];
+
+    const { stdout } = await execFileAsync('yt-dlp', dumpArgs, {
+      timeout: 35_000,
+      maxBuffer: 48 * 1024 * 1024,
+    });
+
+    const info = JSON.parse(stdout) as {
+      id?: string;
+      duration?: number;
+      language?: string;
+      formats?: {
+        format_id?: string;
+        url?: string;
+        protocol?: string;
+        vcodec?: string;
+        acodec?: string;
+        height?: number;
+        abr?: number;
+        tbr?: number;
+        format_note?: string;
+        http_headers?: Record<string, string>;
+      }[];
+    };
+
+    if (info.id && info.language) {
+      languageCacheByVideoId.set(info.id, info.language.split('-')[0]!.toLowerCase());
+    }
+
+    // Ajusta janela caso o roteirista tenha estimado alguns segundos alem do fim do video
+    let effectiveStart = params.startSec;
+    let effectiveEnd = params.endSec;
+    const requestedDur = validateShortClipDuration(params.startSec, params.endSec);
+    if (typeof info.duration === 'number' && info.duration > 10 && effectiveEnd > info.duration) {
+      effectiveEnd = Math.floor(info.duration);
+      effectiveStart = Math.max(0, effectiveEnd - requestedDur);
+    }
+    const clipDuration = Math.max(5, effectiveEnd - effectiveStart);
+
+    const formats = info.formats ?? [];
+    const hlsVideos = formats
+      .filter(
+        (f) =>
+          Boolean(f.url) &&
+          String(f.protocol ?? '').includes('m3u8') &&
+          String(f.vcodec ?? '').startsWith('avc1') &&
+          (f.height ?? 0) >= 240 &&
+          (f.height ?? 0) <= 1080,
+      )
+      .sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
+
+    const hlsAudios = formats
+      .filter(
+        (f) =>
+          Boolean(f.url) &&
+          String(f.protocol ?? '').includes('m3u8') &&
+          (f.vcodec === 'none' || !f.vcodec),
+      )
+      .sort((a, b) => {
+        const aHigh = String(a.format_note ?? '').toLowerCase().includes('high') || a.format_id === '234' ? 1 : 0;
+        const bHigh = String(b.format_note ?? '').toLowerCase().includes('high') || b.format_id === '234' ? 1 : 0;
+        if (aHigh !== bHigh) return bHigh - aHigh;
+        return (b.abr ?? b.tbr ?? 0) - (a.abr ?? a.tbr ?? 0);
+      });
+
+    const vFmt = hlsVideos[0];
+    const aFmt = hlsAudios[0];
+    if (!vFmt?.url || !aFmt?.url) {
+      return { ok: false, reason: 'Formatos HLS m3u8 H.264 nao encontrados no manifesto.' };
+    }
+
+    const localVideoTs = path.join(tempSliceDir, 'video_window.ts');
+    const localAudioTs = path.join(tempSliceDir, 'audio_window.ts');
+
+    const [vDl, aDl] = await Promise.all([
+      downloadHlsTimeWindowToLocalFile({
+        m3u8Url: vFmt.url,
+        headers: vFmt.http_headers ?? {},
+        startSec: effectiveStart,
+        endSec: effectiveEnd,
+        destPath: localVideoTs,
+      }),
+      downloadHlsTimeWindowToLocalFile({
+        m3u8Url: aFmt.url,
+        headers: aFmt.http_headers ?? {},
+        startSec: effectiveStart,
+        endSec: effectiveEnd,
+        destPath: localAudioTs,
+      }),
+    ]);
+
+    const vSeek = Math.max(0, Number((effectiveStart - vDl.windowStartPtsSec).toFixed(3)));
+    const aSeek = Math.max(0, Number((effectiveStart - aDl.windowStartPtsSec).toFixed(3)));
+
+    // Muxa 100% OFFLINE em disco local com `/usr/bin/ffmpeg` (zero rede no ffmpeg!)
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-ss',
+        String(vSeek),
+        '-t',
+        String(clipDuration),
+        '-i',
+        localVideoTs,
+        '-ss',
+        String(aSeek),
+        '-t',
+        String(clipDuration),
+        '-i',
+        localAudioTs,
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        '23',
+        '-maxrate',
+        '4500k',
+        '-bufsize',
+        '9000k',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ar',
+        '44100',
+        '-shortest',
+        params.outputPath,
+      ],
+      { timeout: 55_000 },
+    );
+
+    const outStat = await fs.stat(params.outputPath).catch(() => null);
+    if (outStat && outStat.size > 4096) {
+      return { ok: true };
+    }
+    return { ok: false, reason: 'Arquivo muxado localmente via HLS ficou vazio.' };
+  } catch (err) {
+    return { ok: false, reason: extractMeaningfulYtDlpError(err) };
+  } finally {
+    await fs.rm(tempSliceDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -1116,10 +1434,33 @@ export async function downloadVideoSegmentToFile(params: {
     }
   };
 
-  // Camada 1: yt-dlp com `--js-runtimes node` (`yt-dlp-ejs`), comecando pelo stack padrao nativo (`tv` + `visionos` + `[jsc:node]`)
   const cookiesFilePath = await resolveOptionalYoutubeCookiesFile();
-  const clientProfiles = ['default', 'tv,visionos,web_safari', 'ios,mweb'];
-  let lastErrorReason = 'Erro desconhecido no yt-dlp';
+
+  // Camada 1 (Primaria — Zero Rede no FFmpeg!):
+  // Resolve manifestos HLS via `yt-dlp -J`, baixa apenas os segmentos `.ts` do trecho via Node `fetch`
+  // e faz o mux localmente com `ffmpeg` sobre `/tmp` (imune a `ffmpeg exited with code 1` em datacenter!).
+  const hlsOfflineResult = await tryDownloadSegmentViaYtDlpHlsSlicesAndLocalFfmpeg({
+    sourceUrl: params.sourceUrl,
+    startSec: params.startSec,
+    endSec: params.endSec,
+    outputPath: params.outputPath,
+    cookiesFilePath,
+  });
+  if (hlsOfflineResult.ok) {
+    await saveToDiskAndStorageCache();
+    return { ok: true };
+  }
+
+  // Camada 2: `yt-dlp --download-sections` usando FFmpeg 7.1 dedicado (`/opt/ytdlp-ffmpeg`) quando disponivel
+  const ytdlpFfmpegDir = '/opt/ytdlp-ffmpeg';
+  const hasDedicatedYtFfmpeg = await fs
+    .stat(path.join(ytdlpFfmpegDir, 'ffmpeg'))
+    .then(() => true)
+    .catch(() => false);
+  const ffmpegLocation = hasDedicatedYtFfmpeg ? ytdlpFfmpegDir : undefined;
+
+  const clientProfiles = ['default', 'visionos,tv,web_safari', 'ios,mweb'];
+  let lastErrorReason = hlsOfflineResult.reason ?? 'Erro desconhecido no yt-dlp';
 
   for (const profile of clientProfiles) {
     try {
@@ -1131,6 +1472,7 @@ export async function downloadVideoSegmentToFile(params: {
         outputTemplatePath: params.outputPath,
         playerClients: profile,
         cookiesFilePath,
+        ffmpegLocation,
       });
       await execFileAsync('yt-dlp', ytdlpArgs, { timeout: 75_000 });
       const stat = await fs.stat(params.outputPath).catch(() => null);
@@ -1181,9 +1523,50 @@ export async function downloadVideoSegmentToFile(params: {
     }
   }
 
+  // Camada 3 (Contingencia sem `--download-sections` para videos sem HLS <= 200 MB):
+  // O proprio Python/`curl-cffi` do `yt-dlp` baixa o MP4 completo ate 480p em disco e o `ffmpeg` corta localmente.
+  const localFullFallback = path.join(cacheDir, `${videoId}_video.mp4`);
+  try {
+    await fs.mkdir(cacheDir, { recursive: true });
+    await fs.rm(localFullFallback, { force: true }).catch(() => {});
+    const fullArgs = [
+      '--no-playlist',
+      '--js-runtimes',
+      'node',
+      ...(cookiesFilePath ? ['--cookies', cookiesFilePath] : []),
+      ...(ffmpegLocation ? ['--ffmpeg-location', ffmpegLocation] : []),
+      '--max-filesize',
+      '200M',
+      '-f',
+      'best[height<=480][ext=mp4]/bestvideo[vcodec^=avc1][height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]',
+      '--merge-output-format',
+      'mp4',
+      '-o',
+      localFullFallback,
+      params.sourceUrl,
+    ];
+    await execFileAsync('yt-dlp', fullArgs, { timeout: 85_000 });
+    const fullStat = await fs.stat(localFullFallback).catch(() => null);
+    if (fullStat && fullStat.size > 16_384) {
+      const clipDuration = validateShortClipDuration(params.startSec, params.endSec);
+      const slicedOk = await sliceLocalVideoAndAudioStreamsWithFfmpeg({
+        localVideoPath: localFullFallback,
+        startSec: params.startSec,
+        clipDuration,
+        outputPath: params.outputPath,
+      });
+      if (slicedOk) {
+        await saveToDiskAndStorageCache();
+        return { ok: true };
+      }
+    }
+  } catch {
+    // Mantem lastErrorReason detalhado
+  }
+
   return {
     ok: false,
-    reason: lastErrorReason,
+    reason: `${lastErrorReason} (HLS offline: ${hlsOfflineResult.reason ?? 'indisponivel'})`,
   };
 }
 

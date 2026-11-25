@@ -12,9 +12,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     python3-pip \
     curl \
+    xz-utils \
     ca-certificates \
   && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
   && chmod a+rx /usr/local/bin/yt-dlp \
+  && mkdir -p /opt/ytdlp-ffmpeg \
+  && (if [ "$(uname -m)" = "x86_64" ]; then \
+        curl -fSL https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+        | tar -xJ --strip-components=2 -C /opt/ytdlp-ffmpeg --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'; \
+      fi || echo "[Dockerfile] yt-dlp FFmpeg static opcional indisponivel; usando /usr/bin/ffmpeg") \
   && rm -rf /var/lib/apt/lists/*
 
 # Ambiente Python isolado com yt-dlp[default,curl-cffi] (yt-dlp-ejs + TLS impersonation) + faster-whisper
